@@ -84,7 +84,7 @@ def main():
         flows_num = len(flows_info)
 
         # 拆解流量：用于初始网络场景分配资源
-        # flows_info: 0.flow序号 1.源节点 2.目的节点 3.带宽 4.调制格式 5.SC 6.原flow序号
+        # flows_info: 0.flow序号 1.源节点 2.目的节点 3.带宽 4.逻辑路径 5.物理路径
         # disass_flows_info: 0.flow序号 1.源节点 2.目的节点 3.带宽 4.调制格式 5.SC 6.原flow序号
         disass_flows_info = []
         flow_index = 0
