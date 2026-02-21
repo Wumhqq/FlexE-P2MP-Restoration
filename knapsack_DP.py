@@ -17,10 +17,10 @@ def knapsack_DP(capacity, list_items):
     # 使用 Python 列表来动态存储元素
     item_weight_list = []
     item_value_list = []
-    items = np.array(list_items)
+    items = np.array(list_items, dtype=object)
     row, vol = items.shape
     # 提取每个项目的重量和值
-    if vol == 7:
+    if vol >= 6:
         for i in items:
             item_weight_list.append(i[3])
             item_value_list.append(i[3])

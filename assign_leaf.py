@@ -21,6 +21,41 @@ class ReuseCtx:
 ChosenLeaf = Tuple[int, int, int, int]  # (leaf_p2mp, r_sc0, r_sc1, r_base_final)
 
 
+def _path_to_tuple(p: Any) -> Optional[Tuple[int, ...]]:
+    if p is None:
+        return None
+    try:
+        if hasattr(p, "tolist"):
+            p = p.tolist()
+        if isinstance(p, (list, tuple)):
+            return tuple(int(x) for x in p)
+        return None
+    except Exception:
+        return None
+
+
+def _iter_paths(paths_obj: Any) -> List[Any]:
+    if paths_obj is None:
+        return []
+    if hasattr(paths_obj, "tolist"):
+        paths_obj = paths_obj.tolist()
+    try:
+        if len(paths_obj) == 0:
+            return []
+    except Exception:
+        pass
+    if isinstance(paths_obj, (list, tuple)):
+        if len(paths_obj) > 0 and isinstance(paths_obj[0], (int, float)):
+            return [paths_obj]
+        return list(paths_obj)
+    return [paths_obj]
+
+
+def _path_match(pp: Any, path0_t: Tuple[int, ...], path1_t: Tuple[int, ...]) -> bool:
+    t = _path_to_tuple(pp)
+    return (t is not None) and (t == path0_t or t == path1_t)
+
+
 def _acc_get_dst_leaf(new_flow_acc: Any, subflow_id: int) -> Tuple[int, int]:
     """
     兼容 new_flow_acc 常见格式：
@@ -57,6 +92,8 @@ def choose_receiver_leaf_for_fs_segment(
     sc_need: int,
     P2MP_reuse_fs: bool,
     ref_flow_id: Sequence[int],
+    path0_t: Tuple[int, ...],
+    path1_t: Tuple[int, ...],
     new_flow_acc: Any,
     new_node_P2MP: Any,
     new_P2MP_SC_1: Any,
@@ -157,81 +194,65 @@ def choose_receiver_leaf_for_fs_segment(
 
         return None
 
-    def _fs_segment_unused_with_base(rp: int, base_fs: int) -> bool:
-        """非复用场景：目标 FS 段在该 leaf 上必须无人使用。"""
+    def _fs_segment_ok_with_base(rp: int, base_fs: int) -> bool:
         for fs_abs in range(fs_s_abs, fs_e_abs + 1):
             fs_rel = int(fs_abs - base_fs)
-            used_list = new_P2MP_FS_1[b, rp, fs_rel, 1]
-            if used_list and len(used_list) > 0:
+            try:
+                path_list = new_P2MP_FS_1[b, rp, fs_rel, 2]
+                dst_list = new_P2MP_FS_1[b, rp, fs_rel, 4]
+            except Exception:
                 return False
+            paths = _iter_paths(path_list)
+            if paths:
+                if not any(_path_match(pp, path0_t, path1_t) for pp in paths):
+                    return False
+                if not dst_list:
+                    return False
+                for d in dst_list:
+                    if int(d) != int(b):
+                        return False
         return True
 
-    # -------------------- 复用场景 --------------------
-    if P2MP_reuse_fs:
+    def _reuse_ctx_if_match(rp: int) -> Optional[ReuseCtx]:
+        if not P2MP_reuse_fs:
+            return None
         if not ref_flow_id:
-            return None, None
-
+            return None
         ref_dsts: List[int] = []
         ref_leafs: List[int] = []
         for sub_id in ref_flow_id:
             d, lf = _acc_get_dst_leaf(new_flow_acc, int(sub_id))
             ref_dsts.append(int(d))
             ref_leafs.append(int(lf))
-
         if any(d != ref_dsts[0] for d in ref_dsts):
-            return None, None
+            return None
         if any(lf != ref_leafs[0] for lf in ref_leafs):
-            return None, None
-
+            return None
         ref_dst = int(ref_dsts[0])
         ref_leaf_p = int(ref_leafs[0])
-        if ref_dst != b:
-            return None, None
+        if ref_dst != b or ref_leaf_p != rp:
+            return None
+        return ReuseCtx(ref_dst=ref_dst, ref_leaf_p2mp=ref_leaf_p, ref_subflows=tuple(int(x) for x in ref_flow_id))
 
-        r_type = int(new_node_P2MP[b][ref_leaf_p][3])
-        r_base = int(new_node_P2MP[b][ref_leaf_p][5])
-
-        if r_base >= 0:
-            seg = _find_sc_segment_with_base(ref_leaf_p, r_type, r_base)
-            if seg is None:
-                return None, None
-            chosen: ChosenLeaf = (ref_leaf_p, seg[0], seg[1], int(r_base))
-        else:
-            inf = _infer_base_and_find_sc(ref_leaf_p, r_type)
-            if inf is None:
-                return None, None
-            chosen = (ref_leaf_p, inf[0], inf[1], inf[2])
-
-        ctx = ReuseCtx(
-            ref_dst=ref_dst,
-            ref_leaf_p2mp=ref_leaf_p,
-            ref_subflows=tuple(int(x) for x in ref_flow_id),
-        )
-        return chosen, ctx
-
-    # -------------------- 非复用场景 --------------------
-    # 遍历 b 的所有 leaf P2MP，找第一个可行（你也可以改成“最优”策略）
     for rp in range(len(new_node_P2MP[b])):
 
         r_type = int(new_node_P2MP[b][rp][3])
         r_base = int(new_node_P2MP[b][rp][5])
 
         if r_base >= 0:
-            if not _fs_range_inside_p2mp_block(r_type, r_base, fs_s_abs, fs_e_abs):
-                continue
-            if not _fs_segment_unused_with_base(rp, r_base):
-                continue
             seg = _find_sc_segment_with_base(rp, r_type, r_base)
             if seg is None:
                 continue
-            return (rp, seg[0], seg[1], int(r_base)), None
+            if not _fs_segment_ok_with_base(rp, r_base):
+                continue
+            return (rp, seg[0], seg[1], int(r_base)), _reuse_ctx_if_match(rp)
         else:
             inf = _infer_base_and_find_sc(rp, r_type)
             if inf is None:
                 continue
             base_cand = inf[2]
-            if not _fs_segment_unused_with_base(rp, base_cand):
+            if not _fs_segment_ok_with_base(rp, base_cand):
                 continue
-            return (rp, inf[0], inf[1], base_cand), None
+            return (rp, inf[0], inf[1], base_cand), _reuse_ctx_if_match(rp)
 
     return None, None

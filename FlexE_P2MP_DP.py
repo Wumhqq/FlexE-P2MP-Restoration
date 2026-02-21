@@ -116,7 +116,7 @@ def FlexE_P2MP_DP(flows_info, flows_num, topo_num, topo_dis, Tbox_num, Tbox_P2MP
                             copy_temp[i][2] = copy_temp[i][2] + f[3]
                             # 重新计算所需SC
                             copy_temp[i][3] = math.ceil(copy_temp[i][2] / 25)
-                            if copy_temp[i][1] == 12:
+                            if copy_temp[i][1] <= 12.5:
                                 copy_temp[i][3] = math.ceil(copy_temp[i][2] / 12.5)
                             
                             # 检查添加此流是否超过16 SC限制
@@ -131,7 +131,7 @@ def FlexE_P2MP_DP(flows_info, flows_num, topo_num, topo_dis, Tbox_num, Tbox_P2MP
                                 # 更新剩余SC需求
                                 copy_Sdes_SC[i][2] = copy_Sdes_SC[i][2] - f[3]
                                 copy_Sdes_SC[i][1] = math.ceil(copy_Sdes_SC[i][2] / 25)
-                                if temp[i][1] == 12:
+                                if temp[i][1] <= 12.5:
                                     copy_Sdes_SC[i][1] = math.ceil(copy_Sdes_SC[i][2] / 12.5)
                     sum = np.sum(copy_Sdes_SC[:, 1])
 

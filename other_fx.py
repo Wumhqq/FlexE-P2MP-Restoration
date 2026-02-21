@@ -281,15 +281,13 @@ def build_fs_meta_np_from_p2mp_sc(
     num_p = len(new_P2MP_SC_1[0]) if num_nodes > 0 else 0
 
     # -------- 初始化 object 数组（注意：必须逐格放新 list，避免共享引用）--------
-    new_P2MP_FS_1 = np.empty((num_nodes, num_p, 6, 5), dtype=object)
+    new_P2MP_FS_1 = np.empty((num_nodes, num_p, 6, 9), dtype=object)
     for u in range(num_nodes):
         for p in range(num_p):
             for fs in range(6):
-                new_P2MP_FS_1[u, p, fs, 0] = []
-                new_P2MP_FS_1[u, p, fs, 1] = []
-                new_P2MP_FS_1[u, p, fs, 2] = []
+                for c in range(9):
+                    new_P2MP_FS_1[u, p, fs, c] = []
                 new_P2MP_FS_1[u, p, fs, 3] = None
-                new_P2MP_FS_1[u, p, fs, 4] = []
 
     link_FS_meta = np.empty((link_num, fs_total, 5), dtype=object)
     for l in range(link_num):
@@ -337,6 +335,10 @@ def build_fs_meta_np_from_p2mp_sc(
                     dsts = dst_raw
                 else:
                     dsts = []
+                src_nodes = cell[5] if len(cell) > 5 and isinstance(cell[5], list) else []
+                src_ps = cell[6] if len(cell) > 6 and isinstance(cell[6], list) else []
+                dst_nodes = cell[7] if len(cell) > 7 and isinstance(cell[7], list) else []
+                dst_ps = cell[8] if len(cell) > 8 and isinstance(cell[8], list) else []
 
                 # SC -> 绝对 FS 区间
                 if p_type == 1 and sc_idx <= 0 or p_type == 2 and sc_idx <= 3 or p_type == 3 and sc_idx <= 15:
@@ -370,6 +372,10 @@ def build_fs_meta_np_from_p2mp_sc(
                     f_used = new_P2MP_FS_1[u, p, fs - base_fs, 1]
                     f_path = new_P2MP_FS_1[u, p, fs - base_fs, 2]
                     f_dst = new_P2MP_FS_1[u, p, fs - base_fs, 4]
+                    f_src_node = new_P2MP_FS_1[u, p, fs - base_fs, 5]
+                    f_src_p = new_P2MP_FS_1[u, p, fs - base_fs, 6]
+                    f_dst_node = new_P2MP_FS_1[u, p, fs - base_fs, 7]
+                    f_dst_p = new_P2MP_FS_1[u, p, fs - base_fs, 8]
 
                     # used：直接加（不合并、不去重）
                     for ent in used_list:
@@ -382,6 +388,14 @@ def build_fs_meta_np_from_p2mp_sc(
                     # dst：直接加（不去重）
                     for d in dsts:
                         f_dst.append(d)
+                    for v in src_nodes:
+                        f_src_node.append(v)
+                    for v in src_ps:
+                        f_src_p.append(v)
+                    for v in dst_nodes:
+                        f_dst_node.append(v)
+                    for v in dst_ps:
+                        f_dst_p.append(v)
 
                     # ---- link FS ----
                     for links0 in links_per_path:

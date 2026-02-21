@@ -1,0 +1,79 @@
+Initial_net 顺序式 FlexE-P2MP 分配器代码流程说明
+
+1. 目标与范围
+   - 逐条子流进行顺序式分配，优先复用已有 Hub，失败时开启新 Hub。
+   - Hub 与 Leaf 使用同一段绝对 FS，并在 Leaf 侧镜像 Hub 的 SC 段。
+   - SC 复用采用“路径一致性”匹配：只允许 phys_nodes 完全相同的记录复用。
+
+2. 关键数据结构（外部初始化传入）
+   - flows_info：子流表，7列
+     [0] 子流ID（重编号）[1] 源节点 [2] 目的节点 [3] 带宽Gbps [4] SC_cap [5] SC_num [6] 原始flow序号
+   - node_P2MP[u][p][6]
+     [0] Tbox序号 [1] 端口序号 [2] 使用标记(0未用/1hub/2leaf) [3] 型号
+     [4] 剩余容量Gbps [5] hub_fs0(绝对FS起点，-1为未选)
+   - node_flow[u][p][0]：端口承载的子流列表（保存7列基础信息）
+   - P2MP_SC[u][p][s][c]：每端口16个SC、每SC 5槽位（均为列表）
+     c=0 caps: SC容量；c=1 flows: [子流ID, 使用带宽Gbps, 原flow序号]
+     c=2 phys_paths: 物理路径节点序列(1-based)
+     c=3 remaining_cap: 剩余容量（后处理写入）
+     c=4 dest_labels: 目的节点标签
+   - P2MP_FS[u][p][fs_rel]：P2MP 的相对 FS 记录
+     [1] used_flows: [子流ID, 使用带宽Gbps, 原flow序号]
+     [2] phys_paths: 物理路径节点序列(1-based)
+     [4] dest_labels: 目的节点标签
+   - flow_acc[fid][13]：分配记录
+     0..6 基础信息；7 hub端口；8 leaf端口；9..10 sc_start/end；11..12 fs_s_abs/fs_e_abs（含端）
+   - flow_path[fid][4]：路径记录
+     [0] flow_id_list [1] used_links(0-based) [2] phys_nodes(1-based) [3] orig_flow_labels
+   - link_FS[link][fs]：链路频谱占用计数（0空闲）
+
+3. 主流程（allocate_flows_sequential）
+   - 按源节点分组 flows_info。
+   - 对每条子流：
+     1) 计算物理最短路径 phys_nodes（1-based），映射 used_links（0-based）。
+       2) 尝试复用已有 Hub：
+        - 容量检查：已有流带宽之和 + 当前bw ≤ 400。
+        - 规划 SC 分配（路径一致性 + FS 路径一致性 + SC_cap 剩余容量）。
+        - 新增链路检查：老路径仅检查新 FS，新路径检查全部 FS。
+        - Leaf：同 FS 上已有流则固定 leaf；在叶端校验路径一致性与剩余容量。
+        - 提交：写 node_flow、flow_acc、P2MP_SC、flow_path，并在所有链路上占用 FS。
+     3) 若复用失败，尝试开启新 Hub：
+        - 找空闲端口并根据型号找可用载频块 hub_fs0。
+        - 标记 hub 使用并清空其 SC/flow。
+        - 规划 SC；失败则回滚 hub。
+        - 分配 Leaf；失败则回滚 hub。
+        - 成功则提交（同上）。
+     4) 全部失败：记录 failed_flow_ids；若 stop_on_fail=True 则抛异常。
+
+4. SC 规划（plan_sc_allocation）
+   - 枚举 sc_start 从 0 到当前 hub 型号的最大 SC 索引。
+   - 贪心分配：在当前 SC 上填满剩余容量，不够则进入下一 SC。
+   - 路径一致性：每个 SC 的已用记录必须与当前 phys_nodes/dest 匹配。
+   - FS 路径一致性：该 SC 覆盖的每个 FS 位置必须与当前 phys_nodes 匹配。
+   - 新增链路占用检查：老路径仅检查新 FS，新路径检查全部 FS。
+   - 固定 leaf 判定：若当前 FS 上已有流且目的节点一致，则固定 leaf，否则判失败。
+   - 叶端口选择：优先复用固定 leaf，其次复用已占用 leaf，最后分配空闲 leaf。
+   - 叶端 SC 容量检查：叶端每个 SC 的剩余容量需覆盖对应 usage。
+   - 计算绝对 FS：fs_s_abs/fs_e_abs 由 sc_fs + hub_fs0 得到。
+
+5. 关键不变量
+   - Hub 与 Leaf 的 FS 起点一致（hub_fs0），Leaf 镜像 Hub 的 SC 段。
+   - Leaf SC 分配必须逐 SC 满足容量约束，并返回 leaf_usage 映射。
+   - 链路占用只在成功提交后更新。
+   - SC 复用以路径一致性为准，避免不同路径混用同一 SC 记录。
+
+6. 伪代码（核心）
+   allocate(flows):
+     for flow in flows_by_src:
+       path, used_links = shortest_path(...)
+       if try_reuse_hub(...): continue
+       if try_open_hub(...): continue
+       record_failed_or_raise()
+
+   plan_sc_allocation(...):
+     cap = get_path_sc_cap(...)
+     (min_sc, max_sc) = path_sc_range(...)
+     if none: sc_start = compute_new_start(...)
+     else: sc_start = max_sc or max_sc+1
+     greedy_fill_sc()
+     return sc_start, sc_end, usage, fs_s_abs, fs_e_abs, dest_sc_min, dest_sc_max, leaf_usage

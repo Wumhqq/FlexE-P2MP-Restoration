@@ -9,13 +9,12 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import topology as tp
 from k_shortest_path import k_shortest_path
 from modu_format_Al import modu_format_Al
-from Path_Link import get_links_from_path
 
 from assign_hop import try_assign_one_hop_s1
 from other_fx_fix import (
@@ -187,6 +186,8 @@ def _apply_hop_plan(
     new_flow_acc[sub_id][10] = s_sc1
     new_flow_acc[sub_id][11] = fs_s_abs
     new_flow_acc[sub_id][12] = fs_e_abs
+    new_flow_acc[sub_id][13] = r_sc0
+    new_flow_acc[sub_id][14] = r_sc1
 
     # 更新 link_FS
     for l0 in used_links_0b:
@@ -197,6 +198,95 @@ def _apply_hop_plan(
     new_flow_path[sub_id][1] = [int(x) + 1 for x in used_links_0b]
     new_flow_path[sub_id][2] = list(phy_path_1b)
     new_flow_path[sub_id][3] = [fid]
+
+
+def _attempt_restore_flow(
+    flow: Any,
+    break_node: int,
+    v_adj: np.ndarray,
+    v_phy: Dict[Tuple[int, int], Dict[str, Any]],
+    K_LOGICAL_PATHS: int,
+    flow_metadata_map: Dict[int, Dict[str, Any]],
+    link_index: np.ndarray,
+    fs_total: int,
+    subflow_lookup: Dict[Tuple[int, int, int], int],
+    strict_s1: bool,
+    state: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> Tuple[bool, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    src = int(flow[1])
+    dst = int(flow[2])
+    band = float(flow[3])
+
+    try:
+        logical_paths = k_shortest_path(v_adj, src + 1, dst + 1, K_LOGICAL_PATHS)
+    except Exception:
+        logical_paths = []
+
+    snap = tuple(copy.deepcopy(x) for x in state)
+
+    for lp_nodes_1b, _ in logical_paths:
+        if not logical_path_is_valid(lp_nodes_1b, break_node):
+            continue
+        lp0 = [x - 1 for x in lp_nodes_1b]
+
+        work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path = copy.deepcopy(snap)
+        work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total, link_index)
+
+        ok_path = True
+        for a, b in zip(lp0[:-1], lp0[1:]):
+            if (a, b) not in v_phy:
+                ok_path = False
+                break
+
+            phy_cand = v_phy[(a, b)]
+            phy_path_1b = list(phy_cand["path"])
+            phy_dist = float(phy_cand["dist"])
+
+            sc_cap, _ = modu_format_Al(phy_dist, band)
+            _ensure_sc_cap_left_for_nodes(work_P2MP_SC_1, [a, b], sc_cap)
+
+            ok_hop, plan = try_assign_one_hop_s1(
+                flow=flow,
+                a=a,
+                b=b,
+                phy_candidate=phy_cand,
+                phy_path_1based=phy_path_1b,
+                flow_metadata_map=flow_metadata_map,
+                link_index=link_index,
+                new_link_FS=work_link_FS,
+                new_node_P2MP=work_node_P2MP,
+                new_P2MP_SC_1=work_P2MP_SC_1,
+                new_node_flow=work_node_flow,
+                new_flow_acc=work_flow_acc,
+                new_P2MP_FS_1=work_P2MP_FS_1,
+                new_link_FS_meta=work_link_FS_meta,
+                strict_s1=strict_s1,
+            )
+
+            if not ok_hop or plan is None:
+                ok_path = False
+                break
+
+            plan["phy_path_1based"] = phy_path_1b
+            plan["phy_dist"] = phy_dist
+
+            _apply_hop_plan(
+                flow=flow, a=a, b=b, plan=plan,
+                subflow_lookup=subflow_lookup,
+                new_flow_acc=work_flow_acc,
+                new_node_flow=work_node_flow,
+                new_node_P2MP=work_node_P2MP,
+                new_P2MP_SC_1=work_P2MP_SC_1,
+                new_link_FS=work_link_FS,
+                new_flow_path=work_flow_path,
+            )
+
+            work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total, link_index)
+
+        if ok_path:
+            return True, (work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path)
+
+    return False, state
 
 
 def Heuristic_algorithm(
@@ -305,9 +395,6 @@ def Heuristic_algorithm(
     # --- Tier1 restore ---
     for f in tier1_flows:
         fid = int(f[0])
-        src = int(f[1])
-        dst = int(f[2])
-        band = float(f[3])
 
         # rollback this flow reservation before trying
         manage_s1_reservation_by_copy(
@@ -319,89 +406,21 @@ def Heuristic_algorithm(
         new_P2MP_FS_1, new_link_FS_meta = build_fs_meta_np_from_p2mp_sc(new_P2MP_SC_1, new_node_P2MP, fs_total, link_index)
 
         v_adj, v_phy = flow_vmap_s1[fid]
-
-        restored = False
-
-        try:
-            logical_paths = k_shortest_path(v_adj, src + 1, dst + 1, K_LOGICAL_PATHS)
-        except Exception:
-            logical_paths = []
-
-        # snapshot for each flow
-        snap = (
-            copy.deepcopy(new_flow_acc),
-            copy.deepcopy(new_node_flow),
-            copy.deepcopy(new_node_P2MP),
-            copy.deepcopy(new_P2MP_SC_1),
-            copy.deepcopy(new_link_FS),
-            copy.deepcopy(new_flow_path),
+        restored, new_state = _attempt_restore_flow(
+            flow=f,
+            break_node=break_node,
+            v_adj=v_adj,
+            v_phy=v_phy,
+            K_LOGICAL_PATHS=K_LOGICAL_PATHS,
+            flow_metadata_map=flow_metadata_map,
+            link_index=link_index,
+            fs_total=fs_total,
+            subflow_lookup=subflow_lookup,
+            strict_s1=True,
+            state=(new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path),
         )
-
-        for lp_nodes_1b, _ in logical_paths:
-            if not logical_path_is_valid(lp_nodes_1b, break_node):
-                continue
-            lp0 = [x - 1 for x in lp_nodes_1b]
-
-            # restore snapshot
-            (work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path) = copy.deepcopy(snap)
-            work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total, link_index)
-
-            ok_path = True
-            for a, b in zip(lp0[:-1], lp0[1:]):
-                if (a, b) not in v_phy:
-                    ok_path = False
-                    break
-
-                phy_cand = v_phy[(a, b)]
-                phy_path_1b = list(phy_cand["path"])
-                phy_dist = float(phy_cand["dist"])
-
-                sc_cap, _ = modu_format_Al(phy_dist, band)
-                _ensure_sc_cap_left_for_nodes(work_P2MP_SC_1, [a, b], sc_cap)
-
-                ok_hop, plan = try_assign_one_hop_s1(
-                    flow=f,
-                    a=a,
-                    b=b,
-                    phy_candidate=phy_cand,
-                    phy_path_1based=phy_path_1b,
-                    flow_metadata_map=flow_metadata_map,
-                    link_index=link_index,
-                    new_link_FS=work_link_FS,
-                    new_node_P2MP=work_node_P2MP,
-                    new_P2MP_SC_1=work_P2MP_SC_1,
-                    new_node_flow=work_node_flow,
-                    new_flow_acc=work_flow_acc,
-                    new_P2MP_FS_1=work_P2MP_FS_1,
-                    new_link_FS_meta=work_link_FS_meta,
-                    strict_s1=True,
-                )
-
-                if not ok_hop or plan is None:
-                    ok_path = False
-                    break
-
-                plan["phy_path_1based"] = phy_path_1b
-                plan["phy_dist"] = phy_dist
-
-                _apply_hop_plan(
-                    flow=f, a=a, b=b, plan=plan,
-                    subflow_lookup=subflow_lookup,
-                    new_flow_acc=work_flow_acc,
-                    new_node_flow=work_node_flow,
-                    new_node_P2MP=work_node_P2MP,
-                    new_P2MP_SC_1=work_P2MP_SC_1,
-                    new_link_FS=work_link_FS,
-                    new_flow_path=work_flow_path,
-                )
-
-                work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total, link_index)
-
-            if ok_path:
-                new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path = \
-                    work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path
-                restored = True
-                break
+        if restored:
+            new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path = new_state
 
         if restored:
             tier1_restored.append(f)
@@ -414,93 +433,23 @@ def Heuristic_algorithm(
 
     for f in tier2_flows:
         fid = int(f[0])
-        src = int(f[1])
-        dst = int(f[2])
-        band = float(f[3])
 
         v_adj, v_phy = flow_vmap_s2[fid]
-
-        try:
-            logical_paths = k_shortest_path(v_adj, src + 1, dst + 1, K_LOGICAL_PATHS)
-        except Exception:
-            logical_paths = []
-
-        snap = (
-            copy.deepcopy(new_flow_acc),
-            copy.deepcopy(new_node_flow),
-            copy.deepcopy(new_node_P2MP),
-            copy.deepcopy(new_P2MP_SC_1),
-            copy.deepcopy(new_link_FS),
-            copy.deepcopy(new_flow_path),
+        restored, new_state = _attempt_restore_flow(
+            flow=f,
+            break_node=break_node,
+            v_adj=v_adj,
+            v_phy=v_phy,
+            K_LOGICAL_PATHS=K_LOGICAL_PATHS,
+            flow_metadata_map=flow_metadata_map,
+            link_index=link_index,
+            fs_total=fs_total,
+            subflow_lookup=subflow_lookup,
+            strict_s1=False,
+            state=(new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path),
         )
-
-        restored = False
-
-        for lp_nodes_1b, _ in logical_paths:
-            if not logical_path_is_valid(lp_nodes_1b, break_node):
-                continue
-            lp0 = [x - 1 for x in lp_nodes_1b]
-
-            (work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path) = copy.deepcopy(snap)
-            work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total,
-                                                                              link_index)
-
-            ok_path = True
-            for a, b in zip(lp0[:-1], lp0[1:]):
-                if (a, b) not in v_phy:
-                    ok_path = False
-                    break
-
-                phy_cand = v_phy[(a, b)]
-                phy_path_1b = list(phy_cand["path"])
-                phy_dist = float(phy_cand["dist"])
-
-                sc_cap, _ = modu_format_Al(phy_dist, band)
-                _ensure_sc_cap_left_for_nodes(work_P2MP_SC_1, [a, b], sc_cap)
-
-                ok_hop, plan = try_assign_one_hop_s1(
-                    flow=f,
-                    a=a,
-                    b=b,
-                    phy_candidate=phy_cand,
-                    phy_path_1based=phy_path_1b,
-                    flow_metadata_map=flow_metadata_map,
-                    link_index=link_index,
-                    new_link_FS=work_link_FS,
-                    new_node_P2MP=work_node_P2MP,
-                    new_P2MP_SC_1=work_P2MP_SC_1,
-                    new_node_flow=work_node_flow,
-                    new_flow_acc=work_flow_acc,
-                    new_P2MP_FS_1=work_P2MP_FS_1,
-                    new_link_FS_meta=work_link_FS_meta,
-                    strict_s1=False,
-                )
-
-                if not ok_hop or plan is None:
-                    ok_path = False
-                    break
-
-                plan["phy_path_1based"] = phy_path_1b
-                plan["phy_dist"] = phy_dist
-
-                _apply_hop_plan(
-                    flow=f, a=a, b=b, plan=plan,
-                    subflow_lookup=subflow_lookup,
-                    new_flow_acc=work_flow_acc,
-                    new_node_flow=work_node_flow,
-                    new_node_P2MP=work_node_P2MP,
-                    new_P2MP_SC_1=work_P2MP_SC_1,
-                    new_link_FS=work_link_FS,
-                    new_flow_path=work_flow_path,
-                )
-
-                work_P2MP_FS_1, work_link_FS_meta = build_fs_meta_np_from_p2mp_sc(work_P2MP_SC_1, work_node_P2MP, fs_total, link_index)
-
-            if ok_path:
-                new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path = \
-                    work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC_1, work_link_FS, work_flow_path
-                restored = True
-                break
+        if restored:
+            new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC_1, new_link_FS, new_flow_path = new_state
 
         if restored:
             tier2_restored.append(f)
