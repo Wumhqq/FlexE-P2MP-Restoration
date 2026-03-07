@@ -22,6 +22,17 @@ from other_fx_fix import (
     manage_s1_reservation_by_copy,
 )
 
+def sc_effective_cap(sc_cap: float) -> int:
+    """把 SC 容量映射成可用的整数 TS 容量（不允许 2.5 TS 这种分配）。
+    例如：12.5Gbps 只能承载 floor(12.5/5)=2 个 TS => 10Gbps。
+    """
+    return int(math.floor(float(sc_cap) / TS_UNIT) * TS_UNIT)
+
+def sc_num_from_bw_cap(bw: float, sc_cap: float) -> int:
+    eff = sc_effective_cap(sc_cap)
+    if eff <= 0:
+        raise ValueError(f"Invalid SC_cap={sc_cap}")
+    return int(math.ceil(float(bw) / eff))
 
 def logical_path_is_valid(path_1b: List[int], break_node_0b: int) -> bool:
     """验证逻辑路径：非空、不含中断节点、无重复节点。"""
@@ -81,9 +92,15 @@ def _assign_one_hop_with_initialnet(
     new_flow_path: np.ndarray,
 ) -> bool:
     """按 Initial_net 的约束为单个逻辑跳分配资源。"""
+    # 流程概览：
+    # 1) 校验物理路径与子流映射，提取带宽/子流ID等关键参数
+    # 2) 基于物理路径计算链路占用与 SC 容量，并按策略1固定端口/时隙（若开启 strict_s1）
+    # 3) 先尝试已启用的 hub 端口进行 SC 规划；成功则提交资源并返回
+    # 4) 若已启用端口均失败，再尝试空闲端口：分配 FS block → SC 规划 → 成功提交，否则回滚端口状态
     if not phy_path0 or len(phy_path0) < 2:
         return False
 
+    # 基本流参数与子流映射
     fid = int(flow[0])
     band = float(flow[3])
     sub_id = subflow_lookup.get((fid, a, b), None)
@@ -92,6 +109,7 @@ def _assign_one_hop_with_initialnet(
     sub_id = int(sub_id)
     orig_fid = int(new_flow_acc[sub_id][6]) if int(new_flow_acc[sub_id][6]) >= 0 else fid
 
+    # 物理链路索引（0-based）
     used_links: List[int] = []
     for u, v in zip(phy_path0[:-1], phy_path0[1:]):
         lk = int(link_index[u][v])
@@ -99,9 +117,12 @@ def _assign_one_hop_with_initialnet(
             return False
         used_links.append(lk - 1)
 
+    # 物理路径节点序列（1-based）与容量测算
     phys_nodes_1b = [int(x) + 1 for x in phy_path0]
-    sc_cap, _ = modu_format_Al(phy_dist, band)
+    sc_cap_raw, _ = modu_format_Al(phy_dist, band)
+    sc_cap = float(sc_effective_cap(sc_cap_raw))
 
+    # 策略1：端点硬件/端口固定
     fixed_hub = None
     fixed_leaf = None
     if strict_s1:
@@ -109,10 +130,47 @@ def _assign_one_hop_with_initialnet(
             fixed_hub = int(meta["hub_idx"])
         if int(flow[2]) == b and int(meta.get("leaf_idx", -1)) != -1:
             fixed_leaf = int(meta["leaf_idx"])
+        if fixed_hub is not None and fixed_leaf is not None:
+            hub_cap = float(meta.get("hub_cap", 0.0)) if meta is not None else 0.0
+            leaf_cap = float(meta.get("leaf_cap", 0.0)) if meta is not None else 0.0
+            hub_eff = float(sc_effective_cap(hub_cap)) if hub_cap > 0 else 0.0
+            leaf_eff = float(sc_effective_cap(leaf_cap)) if leaf_cap > 0 else 0.0
+            if hub_eff <= 0 or leaf_eff <= 0 or abs(hub_eff - leaf_eff) > 1e-9:
+                return False
+            sc_cap = hub_eff
+        elif fixed_hub is not None:
+            old_cap = float(meta.get("hub_cap", 0.0)) if meta is not None else 0.0
+            if old_cap > 0:
+                sc_cap = float(sc_effective_cap(old_cap))
+        elif fixed_leaf is not None:
+            old_cap = float(meta.get("leaf_cap", 0.0)) if meta is not None else 0.0
+            if old_cap > 0:
+                sc_cap = float(sc_effective_cap(old_cap))
+
+    fixed_hub_sc_range = None
+    fixed_leaf_sc_range = None
+    fixed_hub_usage = None
+    fixed_leaf_usage = None
+    if strict_s1:
+        if fixed_hub is not None:
+            hub_range = meta.get("hub_sc_range")
+            if hub_range is not None:
+                fixed_hub_sc_range = (int(hub_range[0]), int(hub_range[1]))
+            hub_usage = meta.get("hub_sc_usage")
+            if hub_usage is not None:
+                fixed_hub_usage = {int(k): float(v) for k, v in hub_usage.items()}
+        if fixed_leaf is not None:
+            leaf_range = meta.get("leaf_sc_range")
+            if leaf_range is not None:
+                fixed_leaf_sc_range = (int(leaf_range[0]), int(leaf_range[1]))
+            leaf_usage = meta.get("leaf_sc_usage")
+            if leaf_usage is not None:
+                fixed_leaf_usage = {int(k): float(v) for k, v in leaf_usage.items()}
 
     _p2mp_total = new_node_P2MP.shape[1]
     hub_candidates = [fixed_hub] if fixed_hub is not None else list(range(_p2mp_total))
 
+    # 先尝试已启用的 hub 端口
     for hub_p in hub_candidates:
         if hub_p is None:
             continue
@@ -129,7 +187,8 @@ def _assign_one_hop_with_initialnet(
         plan = _plan_sc_allocation(
             a, hub_p, hub_type, hub_fs0, b,
             phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
-            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path
+            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
+            fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
         )
         if plan is None:
             continue
@@ -144,6 +203,7 @@ def _assign_one_hop_with_initialnet(
         )
         return True
 
+    # 再尝试空闲端口，先分配 FS block 再走同样的规划
     for hub_p in hub_candidates:
         if hub_p is None:
             continue
@@ -163,7 +223,8 @@ def _assign_one_hop_with_initialnet(
         plan = _plan_sc_allocation(
             a, hub_p, hub_type, int(hub_fs0), b,
             phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
-            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path
+            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
+            fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
         )
         if plan is None:
             new_node_P2MP[a][hub_p][2] = 0
@@ -283,34 +344,50 @@ def _attempt_restore_flow(
     state: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
 ) -> Tuple[bool, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """枚举逻辑路径并逐跳提交资源以尝试恢复该流。"""
+    # 流程概览：
+    # 1) 提取源宿节点，计算 K 条逻辑候选路径（1-based）
+    # 2) 为每条逻辑路径创建独立快照，逐跳尝试分配资源
+    # 3) 任一逻辑路径全跳成功则返回新状态，否则回退到原状态
     src = int(flow[1])
     dst = int(flow[2])
 
     try:
+        # 生成逻辑层 k 短路候选路径（节点编号为 1-based）
         logical_paths = k_shortest_path(v_adj, src + 1, dst + 1, K_LOGICAL_PATHS)
     except Exception:
+        # 路径搜索异常时视为无可用逻辑路径
         logical_paths = []
 
+    # 保存原始状态快照，保证路径失败不污染外部状态
     snap = tuple(copy.deepcopy(x) for x in state)
+    # 获取该流的元数据，用于跳级资源分配
     meta = flow_metadata_map.get(int(flow[0]), {})
 
+    # 枚举每条逻辑路径，逐跳尝试分配资源
     for lp_nodes_1b, _ in logical_paths:
+        # 逻辑路径有效性检查（例如绕开断点）
         if not logical_path_is_valid(lp_nodes_1b, break_node):
             continue
+        # 逻辑路径节点改为 0-based 以匹配内部索引
         lp0 = [x - 1 for x in lp_nodes_1b]
 
+        # 对当前逻辑路径建立工作副本，失败可随时丢弃
         work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC, work_link_FS, work_P2MP_FS, work_flow_path = copy.deepcopy(snap)
 
         ok_path = True
+        # 逐跳处理逻辑路径中的相邻节点对
         for a, b in zip(lp0[:-1], lp0[1:]):
+            # 若逻辑跳无法映射到物理候选，当前路径直接失败
             if (a, b) not in v_phy:
                 ok_path = False
                 break
 
+            # 取出该逻辑跳对应的物理路径与距离
             phy_cand = v_phy[(a, b)]
             phy_path0 = list(phy_cand["path"])
             phy_dist = float(phy_cand["dist"])
 
+            # 在该物理跳上尝试分配资源（成功则更新工作副本）
             ok_hop = _assign_one_hop_with_initialnet(
                 flow=flow,
                 a=a,
@@ -329,13 +406,16 @@ def _attempt_restore_flow(
                 new_P2MP_FS=work_P2MP_FS,
                 new_flow_path=work_flow_path,
             )
+            # 单跳失败则该逻辑路径失败
             if not ok_hop:
                 ok_path = False
                 break
 
+        # 所有跳成功则返回该路径的工作状态
         if ok_path:
             return True, (work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC, work_link_FS, work_P2MP_FS, work_flow_path)
 
+    # 所有候选路径失败，返回原始状态
     return False, state
 
 

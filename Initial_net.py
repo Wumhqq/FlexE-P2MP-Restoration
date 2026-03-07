@@ -92,9 +92,9 @@ def _sc_can_use_on_hub(P2MP_SC: np.ndarray, src: int, hub_p: int, sc: int,
     if not paths:
         return True
     for p, d in zip(paths, dsts):
-        if p == phys_nodes and int(d) == int(dest):
-            return True
-    return False
+        if p != phys_nodes or int(d) != int(dest):
+            return False
+    return True
 
 
 def _fs_path_ok_on_p2mp(P2MP_FS: np.ndarray, u: int, p: int, fs_rel: int, phys_nodes: list) -> bool:
@@ -149,8 +149,9 @@ def _leaf_sc_segment_ok(P2MP_SC: np.ndarray, dest: int, leaf_p: int, sc_s: int, 
             paths = []
             dsts = []
         if paths:
-            if not any(p == phys_nodes for p in paths):
-                return False
+            for p in paths:
+                if p != phys_nodes:
+                    return False
             if not dsts:
                 return False
             for d in dsts:
@@ -172,13 +173,17 @@ def _find_leaf_sc_segment_with_base(P2MP_SC: np.ndarray, P2MP_FS: np.ndarray,
     # base_fs 无效直接失败
     if int(base_fs) < 0:
         return None
+
     # 该型号允许的最大 SC 索引
     max_sc_idx = _TYPE_INFO[int(leaf_type)][0] - 1
+
     # hub 侧实际使用的 SC 列表（顺序与 usage 对应）
     hub_sc_list = sorted(int(x) for x in usage.keys())
+
     # 叶端 span 必须与 hub 侧 span 一致
     if len(hub_sc_list) != int(span_len):
         return None
+
     # 枚举 leaf 侧所有连续 SC 段
     for sc0 in range(0, max_sc_idx + 1):
         for sc1 in range(sc0, max_sc_idx + 1):
@@ -223,6 +228,7 @@ def _find_leaf_sc_segment_with_base(P2MP_SC: np.ndarray, P2MP_FS: np.ndarray,
                         break
             if not fs_ok:
                 continue
+            
             if require_fs_empty:
                 # 要求 FS 必须全空，禁止在已占用 FS 上复用
                 fs_free = True
@@ -400,12 +406,112 @@ def _alloc_new_leaf(node_P2MP: np.ndarray, node_flow: np.ndarray, P2MP_SC: np.nd
     return None, None, None, None, False
 
 
+def _alloc_leaf_fixed_usage(node_P2MP: np.ndarray, P2MP_SC: np.ndarray, P2MP_FS: np.ndarray,
+                            dest: int, src_node: int, src_p: int,
+                            fs_s_glo: int, fs_e_glo: int,
+                            phys_nodes: list, des: int,
+                            sc_cap: float, bw: float,
+                            fixed_leaf: int | None,
+                            fixed_leaf_sc_range: tuple[int, int] | None,
+                            fixed_leaf_usage: dict | None) -> tuple[int | None, int | None, int | None, dict | None]:
+    """复用固定 leaf 端口与固定 SC 使用量，失败返回全 None。"""
+    if fixed_leaf is None or fixed_leaf_sc_range is None or fixed_leaf_usage is None:
+        return None, None, None, None
+    p = int(fixed_leaf)
+
+    # 端口范围与启用状态校验
+    if p < 0 or p >= node_P2MP.shape[1]:
+        return None, None, None, None
+    if int(node_P2MP[dest][p][2]) == 0:
+        return None, None, None, None
+    leaf_type = int(node_P2MP[dest][p][3])
+    leaf_base = int(node_P2MP[dest][p][5])
+
+    # base_fs 必须存在
+    if leaf_base < 0:
+        return None, None, None, None
+    sc0 = int(fixed_leaf_sc_range[0])
+    sc1 = int(fixed_leaf_sc_range[1])
+    max_sc_idx = _TYPE_INFO[int(leaf_type)][0] - 1
+
+    # SC 区间合法性与覆盖完整性校验
+    if sc0 < 0 or sc1 < 0 or sc0 > sc1 or sc1 > max_sc_idx:
+        return None, None, None, None
+    expected_sc = set(range(int(sc0), int(sc1) + 1))
+    if set(int(k) for k in fixed_leaf_usage.keys()) != expected_sc:
+        return None, None, None, None
+
+    # 用量和带宽必须一致
+    usage_sum = sum(float(fixed_leaf_usage[int(sc)]) for sc in expected_sc)
+    if abs(float(usage_sum) - float(bw)) > 1e-6:
+        return None, None, None, None
+    fs_s_rel = sc_fs(int(leaf_type), int(sc0), 1)
+    fs_e_rel = sc_fs(int(leaf_type), int(sc1), 2)
+
+    # leaf 侧 FS 必须与 hub 侧绝对 FS 区间对齐
+    if int(leaf_base) + int(fs_s_rel) != int(fs_s_glo):
+        return None, None, None, None
+    if int(leaf_base) + int(fs_e_rel) != int(fs_e_glo):
+        return None, None, None, None
+
+    # FS 路径一致性 + 发送端一致性校验
+    for fs_rel in range(int(fs_s_rel), int(fs_e_rel) + 1):
+        if not _fs_path_ok_on_p2mp(P2MP_FS, dest, p, int(fs_rel), phys_nodes):
+            return None, None, None, None
+        try:
+            src_node_list = P2MP_FS[dest][p][int(fs_rel)][5]
+            src_p_list = P2MP_FS[dest][p][int(fs_rel)][6]
+        except Exception:
+            src_node_list = []
+            src_p_list = []
+        if src_node_list and src_p_list:
+            if len(src_node_list) != len(src_p_list):
+                return None, None, None, None
+            for idx in range(len(src_node_list)):
+                try:
+                    sn = int(src_node_list[idx])
+                    sp = int(src_p_list[idx])
+                except Exception:
+                    return None, None, None, None
+                if sn != int(src_node) or sp != int(src_p):
+                    return None, None, None, None
+                    
+    # SC 路径与目的节点一致性校验
+    if not _leaf_sc_segment_ok(P2MP_SC, dest, p, sc0, sc1, phys_nodes, des):
+        return None, None, None, None
+
+    # 每个 SC 的容量必须覆盖固定使用量
+    for lsc in range(int(sc0), int(sc1) + 1):
+        try:
+            flows = P2MP_SC[dest][p][int(lsc)][1]
+            paths = P2MP_SC[dest][p][int(lsc)][2]
+            dsts = P2MP_SC[dest][p][int(lsc)][4]
+        except Exception:
+            flows = []
+            paths = []
+            dsts = []
+        used = 0.0
+        if flows and paths and dsts:
+            for entry, path, d in zip(flows, paths, dsts):
+                if path == phys_nodes and int(d) == int(des):
+                    used += float(entry[1])
+        if float(used) + float(fixed_leaf_usage[int(lsc)]) > float(sc_cap) + 1e-9:
+            return None, None, None, None
+    # 返回固定 leaf 与固定使用量
+    return int(p), int(sc0), int(sc1), {int(k): float(v) for k, v in fixed_leaf_usage.items()}
+
+
 def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest: int,
                         phys_nodes: list, bw: float, sc_cap: float, flow_ids_on_hub: list,
                         flow_acc: np.ndarray, P2MP_SC: np.ndarray,
                         node_P2MP: np.ndarray, node_flow: np.ndarray, link_FS: np.ndarray,
                         P2MP_FS: np.ndarray,
-                        used_links: list, flow_path: np.ndarray):
+                        used_links: list, flow_path: np.ndarray,
+                        fixed_hub_sc_range: tuple[int, int] | None = None,
+                        fixed_hub_usage: dict | None = None,
+                        fixed_leaf: int | None = None,
+                        fixed_leaf_sc_range: tuple[int, int] | None = None,
+                        fixed_leaf_usage: dict | None = None):
     """
     为单条流在给定 hub 上规划 SC 分配，不直接修改状态。
     返回 (sc_s, sc_e, usage_dict{sc:used_bw}, fs_s_glo, fs_e_glo,
@@ -414,51 +520,80 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
     # 该 hub 类型允许的最大 SC 索引
     max_sc_idx = _TYPE_INFO[int(hub_type)][0] - 1
 
-    # 当前流在单个 SC 上的可用容量基准
-    sc_cap_use = float(sc_cap)
+    # 当前流在单个 SC 上的可用容量基准（按 TS 粒度向下取整）
+    sc_cap_use = float(sc_effective_cap(sc_cap))
 
-    # 枚举可能的起始 SC
-    for sc_start in range(0, max_sc_idx + 1):
-        # 需要分配的剩余带宽
-        remaining = float(bw)
-        # 记录每个 SC 实际分配的带宽
-        usage = {}
-        # 当前尝试填充的 SC 索引
-        cur_sc = int(sc_start)
+    # 固定 hub 模式：直接使用给定 SC 区间与用量
+    usage_fixed = None
+    sc_end_fixed = None
+    if fixed_hub_sc_range is not None and fixed_hub_usage is not None:
+        sc_end_fixed = int(fixed_hub_sc_range[1])
+        sc_start_fixed = int(fixed_hub_sc_range[0])
+        if sc_start_fixed < 0 or sc_end_fixed < 0 or sc_start_fixed > sc_end_fixed:
+            return None
+        if sc_end_fixed > max_sc_idx:
+            return None
+        expected_sc = set(range(int(sc_start_fixed), int(sc_end_fixed) + 1))
+        if set(int(k) for k in fixed_hub_usage.keys()) != expected_sc:
+            return None
+        usage_fixed = {int(k): float(v) for k, v in fixed_hub_usage.items()}
+        usage_sum = sum(float(usage_fixed[int(sc)]) for sc in expected_sc)
+        if abs(float(usage_sum) - float(bw)) > 1e-6:
+            return None
+        sc_start_iter = [int(sc_start_fixed)]
+    else:
+        sc_start_iter = range(0, max_sc_idx + 1)
 
-        # 在连续 SC 上贪心填充剩余带宽
-        while remaining > 1e-9:
-            if cur_sc > max_sc_idx:
-                usage = None
-                break
-            if not _sc_can_use_on_hub(P2MP_SC, src, hub_p, int(cur_sc), phys_nodes, dest):
-                usage = None
-                break
-            if not _sc_fs_path_ok(P2MP_FS, src, hub_p, int(hub_type), int(cur_sc), phys_nodes):
-                usage = None
-                break
-            # 该 SC 在相同路径上的已占用带宽
-            used_in_sc = _sc_used_bw_for_path(src, hub_p, int(cur_sc), phys_nodes, P2MP_SC)
-            # 当前 SC 还能容纳的带宽
-            cur_spare = float(sc_cap_use) - float(used_in_sc)
-            if cur_spare <= 1e-9:
-                usage = None
-                break
-            # 本 SC 分配的带宽不超过剩余需求与可用容量
-            take = min(remaining, cur_spare)
-            usage[cur_sc] = usage.get(cur_sc, 0.0) + float(take)
-            remaining -= float(take)
-            if remaining <= 1e-9:
-                break
-            # 继续尝试下一个 SC
-            cur_sc += 1
+    # 遍历起点：固定模式只有一个起点，非固定模式遍历所有起点
+    for sc_start in sc_start_iter:
+        usage = None
+        sc_end = None
+        if sc_end_fixed is not None and usage_fixed is not None:
+            # 固定模式：只做一致性与容量校验，不重新分配
+            sc_end = int(sc_end_fixed)
+            usage = dict(usage_fixed)
+            for sc_check in range(int(sc_start), int(sc_end) + 1):
+                if not _sc_can_use_on_hub(P2MP_SC, src, hub_p, int(sc_check), phys_nodes, dest):
+                    usage = None
+                    break
+                if not _sc_fs_path_ok(P2MP_FS, src, hub_p, int(hub_type), int(sc_check), phys_nodes):
+                    usage = None
+                    break
+                used_in_sc = _sc_used_bw_for_path(src, hub_p, int(sc_check), phys_nodes, P2MP_SC)
+                if float(used_in_sc) + float(usage[int(sc_check)]) > float(sc_cap_use) + 1e-9:
+                    usage = None
+                    break
+        else:
+            # 非固定模式：贪心分配连续 SC
+            remaining = float(bw)
+            usage = {}
+            cur_sc = int(sc_start)
+            while remaining > 1e-9:
+                if cur_sc > max_sc_idx:
+                    usage = None
+                    break
+                if not _sc_can_use_on_hub(P2MP_SC, src, hub_p, int(cur_sc), phys_nodes, dest):
+                    usage = None
+                    break
+                if not _sc_fs_path_ok(P2MP_FS, src, hub_p, int(hub_type), int(cur_sc), phys_nodes):
+                    usage = None
+                    break
+                used_in_sc = _sc_used_bw_for_path(src, hub_p, int(cur_sc), phys_nodes, P2MP_SC)
+                cur_spare = float(sc_cap_use) - float(used_in_sc)
+                if cur_spare <= 1e-9:
+                    usage = None
+                    break
+                take = min(remaining, cur_spare)
+                usage[cur_sc] = usage.get(cur_sc, 0.0) + float(take)
+                remaining -= float(take)
+                if remaining <= 1e-9:
+                    break
+                cur_sc += 1
+            if usage is not None:
+                sc_end = int(cur_sc)
 
-        # 如果当前 sc_start 不可行，尝试下一个起点
-        if usage is None:
+        if usage is None or sc_end is None:
             continue
-
-        # 本次分配覆盖的 SC 终点
-        sc_end = int(cur_sc)
         # 计算相对 FS 起止与绝对 FS 起止
         fs_s_rel = sc_fs(int(hub_type), int(sc_start), 1)
         fs_e_rel = sc_fs(int(hub_type), int(sc_end), 2)
@@ -503,7 +638,7 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
             continue
 
         # 检查同一相对 FS 上已有流的目的节点与目的端口是否一致
-        fixed_leaf = None
+        fixed_leaf_from_fs = None
         fixed_leaf_invalid = False
         for fs_rel in range(int(fs_s_rel), int(fs_e_rel) + 1):
             try:
@@ -530,9 +665,9 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
                     fixed_leaf_invalid = True
                     break
                 # 首次遇到的 leaf 作为固定 leaf，后续必须一致
-                if fixed_leaf is None:
-                    fixed_leaf = leaf_i
-                elif fixed_leaf != leaf_i:
+                if fixed_leaf_from_fs is None:
+                    fixed_leaf_from_fs = leaf_i
+                elif fixed_leaf_from_fs != leaf_i:
                     fixed_leaf_invalid = True
                     break
             # 该 FS 已有占用但不满足一致性，直接判失败
@@ -542,14 +677,30 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
             continue
 
         # 选择或分配 leaf 端口，并获取 leaf 的 SC 段
-        leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage, _ = _alloc_new_leaf(
-            node_P2MP, node_flow, P2MP_SC, P2MP_FS,
-            dest, src, hub_p,
-            fs_s_glo, fs_e_glo, int(sc_end) - int(sc_start) + 1,
-            phys_nodes, dest,
-            usage, sc_cap,
-            fixed_leaf
-        )
+        # 固定 leaf 与 FS 内已有 leaf 不一致则失败
+        if fixed_leaf is not None and fixed_leaf_from_fs is not None and int(fixed_leaf_from_fs) != int(fixed_leaf):
+            continue
+        leaf_fixed_use = fixed_leaf if fixed_leaf is not None else fixed_leaf_from_fs
+        # 固定 leaf 模式：使用固定 SC 用量做严格复用
+        if fixed_leaf_usage is not None and fixed_leaf_sc_range is not None and leaf_fixed_use is not None:
+            leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage = _alloc_leaf_fixed_usage(
+                node_P2MP, P2MP_SC, P2MP_FS,
+                dest, src, hub_p,
+                fs_s_glo, fs_e_glo,
+                phys_nodes, dest,
+                sc_cap, bw,
+                leaf_fixed_use, fixed_leaf_sc_range, fixed_leaf_usage,
+            )
+        else:
+            # 非固定 leaf：按既有逻辑寻找或分配 leaf
+            leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage, _ = _alloc_new_leaf(
+                node_P2MP, node_flow, P2MP_SC, P2MP_FS,
+                dest, src, hub_p,
+                fs_s_glo, fs_e_glo, int(sc_end) - int(sc_start) + 1,
+                phys_nodes, dest,
+                usage, sc_cap,
+                leaf_fixed_use
+            )
         if leaf_p is None or leaf_sc_s is None or leaf_sc_e is None or leaf_usage is None:
             continue
 
@@ -787,7 +938,7 @@ def allocate_flows_sequential(
                 if stop_on_fail:
                     raise RuntimeError(f"Sequential allocation failed for flow_id={fid} (src={src}, des={des}, bw={bw})")
 
-    return node_flow, node_P2MP, flow_acc, link_FS, P2MP_SC, P2MP_FS, flow_path
+    return node_flow, node_P2MP, flow_acc, link_FS, P2MP_SC, P2MP_FS, flow_path, failed
 
 
 def FlexE_P2MP_Sequential(flows_info, flows_num, topo_num, topo_dis, link_num, link_index, Tbox_num, Tbox_P2MP,

@@ -13,29 +13,10 @@ import numpy as np
 from SC_FS import sc_fs
 
 
-def _cell_total_cap(cell: np.ndarray) -> float:
-    """
-    推断单个 SC 的“总容量”：
-      1) 若 cell[0] 非空，则 max(cell[0]) 视为 total_cap
-      2) 否则 total_cap = cap_left + sum(used)
-      3) 都没有则 0
-    """
-    cap_list = cell[0]
-    if cap_list:
-        return max(float(v) for v in cap_list)
-
-    used_list = cell[1]
-    used_sum = sum(float(e[1]) for e in used_list) if used_list else 0.0
-
-    cap_left_list = cell[3]
-    cap_left = float(cap_left_list[0]) if cap_left_list else 0.0
-    return cap_left + used_sum
-
-
 def _recompute_cell_cap_left(cell: np.ndarray) -> None:
     used_list = cell[1]
     used_sum = sum(float(e[1]) for e in used_list) if used_list else 0.0
-    total = _cell_total_cap(cell)
+    total = float(cell[0][0]) if cell[0] else 0.0
     cell[3] = [total - used_sum]
 
 
@@ -50,13 +31,8 @@ def _copy_sc_records_by_subflow_id(old_cell: np.ndarray, new_cell: np.ndarray, s
         if int(entry[0]) != subflow_id:
             continue
 
-        # 防止重复复制
-        if any(int(e[0]) == subflow_id for e in new_cell[1]):
-            # 但一个 cell 可能有多条同 subflow 的记录？通常不会，这里选择跳过
-            continue
-
         # 对齐复制
-        cap_val = old_cell[0][idx] if idx < len(old_cell[0]) else _cell_total_cap(old_cell)
+        cap_val = old_cell[0][idx] if idx < len(old_cell[0]) else (old_cell[0][0] if old_cell[0] else 0.0)
         path_val = old_cell[2][idx] if idx < len(old_cell[2]) else []
         dst_val = old_cell[4][idx] if idx < len(old_cell[4]) else -1
 
@@ -73,12 +49,27 @@ def _remove_sc_records_by_subflow_id(cell: np.ndarray, subflow_id: int) -> None:
     删除 cell 中所有 entry[0]==subflow_id 的记录，并保持 0/1/2/4 列对齐。
     """
 
-    keep_idx = [i for i, e in enumerate(cell[1]) if int(e[0]) != subflow_id]
+    kept_0 = []
+    kept_1 = []
+    kept_2 = []
+    kept_4 = []
 
-    cell[0] = [cell[0][i] for i in keep_idx] if cell[0] else []
-    cell[1] = [cell[1][i] for i in keep_idx] if cell[1] else []
-    cell[2] = [cell[2][i] for i in keep_idx] if cell[2] else []
-    cell[4] = [cell[4][i] for i in keep_idx] if cell[4] else []
+    for i, entry in enumerate(cell[1]):
+        if int(entry[0]) == subflow_id:
+            continue
+        if cell[0]:
+            kept_0.append(cell[0][i])
+        if cell[1]:
+            kept_1.append(cell[1][i])
+        if cell[2]:
+            kept_2.append(cell[2][i])
+        if cell[4]:
+            kept_4.append(cell[4][i])
+
+    cell[0] = kept_0
+    cell[1] = kept_1
+    cell[2] = kept_2
+    cell[4] = kept_4
 
     # 如果空了，可以把 cap_left 设为 [0]（后续 heuristic 会按需初始化）
     if len(cell[1]) == 0:
@@ -106,6 +97,8 @@ def extract_old_flow_info(flow_id: int, src: int, dst: int,
         "leaf_sc_range": None,
         "hub_cap": 0.0,
         "leaf_cap": 0.0,
+        "hub_sc_usage": None,
+        "leaf_sc_usage": None,
     }
 
     # 取 DP 中属于该 orig flow 的所有 subflow
@@ -126,6 +119,46 @@ def extract_old_flow_info(flow_id: int, src: int, dst: int,
             if int(row[13]) >= 0 and int(row[14]) >= 0:
                 info["leaf_sc_range"] = (int(row[13]), int(row[14]))
 
+    # 统计该 flow 在源端(hub)侧每个 SC 的实际使用量
+    if info["src_small_id"] != -1 and info["hub_idx"] != -1 and info["hub_sc_range"] is not None:
+        a = int(src)
+        hub_p = int(info["hub_idx"])
+        sub_id = int(info["src_small_id"])
+        hub_usage = {}
+        # 遍历所有 SC，从 DP 的 P2MP_SC 里累加该 subflow 的用量
+        for sc in range(P2MP_SC_DP.shape[2]):
+            try:
+                used_list = P2MP_SC_DP[a][hub_p][int(sc)][1]
+            except Exception:
+                continue
+            if not used_list:
+                continue
+            for entry in used_list:
+                if int(entry[0]) == sub_id:
+                    hub_usage[int(sc)] = hub_usage.get(int(sc), 0.0) + float(entry[1])
+        if hub_usage:
+            info["hub_sc_usage"] = hub_usage
+
+    # 统计该 flow 在目的端(leaf)侧每个 SC 的实际使用量
+    if info["des_small_id"] != -1 and info["leaf_idx"] != -1 and info["leaf_sc_range"] is not None:
+        b = int(dst)
+        leaf_p = int(info["leaf_idx"])
+        sub_id = int(info["des_small_id"])
+        leaf_usage = {}
+        # 遍历所有 SC，从 DP 的 P2MP_SC 里累加该 subflow 的用量
+        for sc in range(P2MP_SC_DP.shape[2]):
+            try:
+                used_list = P2MP_SC_DP[b][leaf_p][int(sc)][1]
+            except Exception:
+                continue
+            if not used_list:
+                continue
+            for entry in used_list:
+                if int(entry[0]) == sub_id:
+                    leaf_usage[int(sc)] = leaf_usage.get(int(sc), 0.0) + float(entry[1])
+        if leaf_usage:
+            info["leaf_sc_usage"] = leaf_usage
+
     return info
 
 
@@ -135,8 +168,15 @@ def build_virtual_topology(src: int, dst: int, topo_num: int, phy_pool: Dict[Tup
                            orig_src_modu: int, orig_dst_modu: int,
                            RECONFIG_PENALTY: float, HOP_PENALTY: float) -> Tuple[np.ndarray, Dict[Tuple[int, int], Dict[str, Any]]]:
     """
-    构建虚拟拓扑矩阵 + 每条虚拟边对应的最佳物理候选(含 path/dist/modu/cost)
-    其中 force_strategy1=True 时会过滤掉不兼容旧硬件的物理候选
+    从每条虚拟边 (u, v) 的候选物理路径里选最低代价的一条 ，并写入虚拟拓扑：
+    - 遍历 phy_pool 里每条虚拟边的候选路径列表
+    - 跳过端点能力不足的虚拟边
+    - 对每条候选计算代价 cost = 物理距离 + 跳数惩罚
+    - 判断是否需要重构（端点调制不兼容）
+        - 策略1：不兼容就丢弃该候选
+        - 策略2：允许但加重构惩罚
+    - 选代价最小的候选作为该虚拟边的物理映射
+    - 最后返回更新后的 virtual_adj 和 best_phy_map
     """
     virtual_adj = np.full((topo_num, topo_num), np.inf)
     np.fill_diagonal(virtual_adj, 0.0)
@@ -180,6 +220,8 @@ def build_virtual_topology(src: int, dst: int, topo_num: int, phy_pool: Dict[Tup
             reconfig_dst = (v == dst) and (not is_path_compatible(phy_dist, orig_dst_modu))
             needs_reconfig = reconfig_src or reconfig_dst
 
+            # 这里的 continue 是为了在强制策略1时直接丢弃“需要重构的候选路径”。
+            # 因为 needs_reconfig 表示端点调制与原配置不兼容，而策略1要求完全复用原配置，所以一旦不兼容就跳过该候选，继续看下一个候选。
             if force_strategy1 and needs_reconfig:
                 continue
             if (not force_strategy1) and needs_reconfig:
@@ -212,60 +254,69 @@ def manage_s1_reservation_by_copy(flow_list: List[Any], metadata_map: Dict[int, 
         raise ValueError(f"Unknown action={action}")
 
     for flow in flow_list:
+        # flow: [orig_flow_id, src, dst, band, ...]
         f_id = int(flow[0])
+        src = int(flow[1])
+        dst = int(flow[2])
+        band = float(flow[3])
 
-        # 该 orig flow 可能有多 hop -> 遍历 DP 中属于它的所有 subflow
-        rows = flow_acc_DP[flow_acc_DP[:, 6] == f_id]
-        for row in rows:
-            sub_id = int(row[0])
-            a = int(row[1])
-            b = int(row[2])
-            band = float(row[3])
+        # 优先使用 metadata_map 里保存的端点子流与端口信息
+        info = metadata_map.get(f_id, {})
+        src_small_id = int(info.get("src_small_id", -1)) if info else -1
+        des_small_id = int(info.get("des_small_id", -1)) if info else -1
+        hub_p = int(info.get("hub_idx", -1)) if info else -1
+        leaf_p = int(info.get("leaf_idx", -1)) if info else -1
+        hub_range = info.get("hub_sc_range", None) if info else None
+        leaf_range = info.get("leaf_sc_range", None) if info else None
 
-            hub_p = int(row[7])
-            leaf_p = int(row[8])
-            sc0 = int(row[9])
-            sc1 = int(row[10])
+        if hub_p == -1 or hub_range is None or src_small_id == -1 or leaf_p == -1 or leaf_range is None or des_small_id == -1:
+            raise ValueError(f"metadata incomplete for flow {f_id}")
 
-            # --- hub side (a, hub_p, [sc0,sc1]) ---
-            if hub_p != -1 and sc0 >= 0 and sc1 >= 0:
+        # 只对源端 hub 预占/回滚
+        if hub_p != -1 and hub_range is not None and src_small_id != -1:
+            sc0, sc1 = int(hub_range[0]), int(hub_range[1])
+            if sc0 >= 0 and sc1 >= 0:
                 if action == "reserve":
-                    new_node_P2MP[a][hub_p][4] -= band
-                    if new_node_P2MP[a][hub_p][5] == -1:
-                        new_node_P2MP[a][hub_p][5] = node_P2MP_DP[a][hub_p][5]
-                    if new_node_P2MP[a][hub_p][2] == 0:
-                        new_node_P2MP[a][hub_p][2] = 1
+                    # 预占带宽：扣除端口剩余带宽
+                    new_node_P2MP[src][hub_p][4] -= band
+                    # 预占端口状态：标记为 Hub
+                    if new_node_P2MP[src][hub_p][5] == -1:
+                        new_node_P2MP[src][hub_p][5] = node_P2MP_DP[src][hub_p][5]
+                    if new_node_P2MP[src][hub_p][2] == 0:
+                        new_node_P2MP[src][hub_p][2] = 1
 
+                    # 预占时隙/SC：复制该流在对应时隙范围内的占用记录
                     for s in range(sc0, sc1 + 1):
-                        _copy_sc_records_by_subflow_id(P2MP_SC_DP[a][hub_p][s], new_P2MP_SC_1[a][hub_p][s], sub_id)
+                        _copy_sc_records_by_subflow_id(P2MP_SC_DP[src][hub_p][s], new_P2MP_SC_1[src][hub_p][s], src_small_id)
                 else:
-                    new_node_P2MP[a][hub_p][4] += band
+                    # 回滚带宽：加回端口剩余带宽
+                    new_node_P2MP[src][hub_p][4] += band
+                    # 回滚时隙/SC：删除该流在对应时隙范围内的占用记录
                     for s in range(sc0, sc1 + 1):
-                        _remove_sc_records_by_subflow_id(new_P2MP_SC_1[a][hub_p][s], sub_id)
+                        _remove_sc_records_by_subflow_id(new_P2MP_SC_1[src][hub_p][s], src_small_id)
 
-            # --- leaf side (b, leaf_p, leaf_sc_range inferred) ---
-            if leaf_p != -1:
-                used_scs = []
-                for s in range(16):
-                    used_list = P2MP_SC_DP[b][leaf_p][s][1]
-                    if any(int(e[0]) == sub_id for e in used_list):
-                        used_scs.append(s)
+        # 只对目的端 leaf 预占/回滚
+        if leaf_p != -1 and leaf_range is not None and des_small_id != -1:
+            l0, l1 = int(leaf_range[0]), int(leaf_range[1])
+            if l0 >= 0 and l1 >= 0:
+                if action == "reserve":
+                    # 预占带宽：扣除端口剩余带宽
+                    new_node_P2MP[dst][leaf_p][4] -= band
+                    # 预占端口状态：标记为 Leaf
+                    if new_node_P2MP[dst][leaf_p][5] == -1:
+                        new_node_P2MP[dst][leaf_p][5] = node_P2MP_DP[dst][leaf_p][5]
+                    if new_node_P2MP[dst][leaf_p][2] == 0:
+                        new_node_P2MP[dst][leaf_p][2] = 2
 
-                if used_scs:
-                    l0, l1 = min(used_scs), max(used_scs)
-                    if action == "reserve":
-                        new_node_P2MP[b][leaf_p][4] -= band
-                        if new_node_P2MP[b][leaf_p][5] == -1:
-                            new_node_P2MP[b][leaf_p][5] = node_P2MP_DP[b][leaf_p][5]
-                        if new_node_P2MP[b][leaf_p][2] == 0:
-                            new_node_P2MP[b][leaf_p][2] = 2
-
-                        for s in range(l0, l1 + 1):
-                            _copy_sc_records_by_subflow_id(P2MP_SC_DP[b][leaf_p][s], new_P2MP_SC_1[b][leaf_p][s], sub_id)
-                    else:
-                        new_node_P2MP[b][leaf_p][4] += band
-                        for s in range(l0, l1 + 1):
-                            _remove_sc_records_by_subflow_id(new_P2MP_SC_1[b][leaf_p][s], sub_id)
+                    # 预占时隙/SC：复制该流在对应时隙范围内的占用记录
+                    for s in range(l0, l1 + 1):
+                        _copy_sc_records_by_subflow_id(P2MP_SC_DP[dst][leaf_p][s], new_P2MP_SC_1[dst][leaf_p][s], des_small_id)
+                else:
+                    # 回滚带宽：加回端口剩余带宽
+                    new_node_P2MP[dst][leaf_p][4] += band
+                    # 回滚时隙/SC：删除该流在对应时隙范围内的占用记录
+                    for s in range(l0, l1 + 1):
+                        _remove_sc_records_by_subflow_id(new_P2MP_SC_1[dst][leaf_p][s], des_small_id)
 
 
 def build_fs_meta_np_from_p2mp_sc(P2MP_SC: np.ndarray, node_P2MP: np.ndarray,

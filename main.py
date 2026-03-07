@@ -12,7 +12,7 @@ from topology import topology
 import random
 from k_shortest_path import k_shortest_path
 from modu_format_Al import modu_format_Al
-from DP_for_Res import FlexE_P2MP_DP
+from DP_for_Res import restore_with_dp
 from test_right import test_right
 from ILP import Restoration_ILP
 from AG_S1F import Heuristic_algorithm
@@ -76,7 +76,7 @@ def main():
     band = np.array([10, 40, 25])
     Tbox_num = 60#均分成3类
     Tbox_P2MP = 1
-    type_P2MP = [[1, 1], [2, 4], [3, 16]]
+    type_P2MP = [[1, 1, 1], [2, 4, 2], [3, 16, 6]]
 
     # 生成流量：用于保存原始记录
     # flows_info: 0.flow序号 1.源节点 2.目的节点 3.带宽 4.逻辑路径 5.物理路径
@@ -332,24 +332,22 @@ def main():
     else:
         print("Restoration_Sequential completed successfully.")
 
-    scr_flows_dp = [[] for _ in range(topo_num)]
-    for f in disass_flows_info:
-        scr_flows_dp[int(f[1])].append(f)
-    init_resources_dp = (
-        type_P2MP_init, p2mp_total_init, t1_init, t2_init, new_link_FS, disass_flows_info, scr_flows_dp,
-        new_node_P2MP, new_node_flow, new_flow_acc, new_P2MP_SC_1, new_P2MP_FS, new_flow_path
-    )
-    node_flow_dp, node_P2MP_dp, flow_acc_dp, link_FS_dp, P2MP_SC_dp, flow_path_dp = FlexE_P2MP_DP(
-        disass_flows_info,
-        flows_num,
+    node_flow_dp, node_P2MP_dp, flow_acc_dp, link_FS_dp, P2MP_SC_dp, flow_path_dp = restore_with_dp(
+        affected_flow,
         topo_num,
         topo_dis,
         link_num,
         link_index,
         Tbox_num,
         Tbox_P2MP,
-        init_resources=init_resources_dp,
-        restore_mode=True,
+        new_node_flow,
+        new_node_P2MP,
+        new_link_FS,
+        new_P2MP_SC_1,
+        new_P2MP_FS,
+        new_flow_acc,
+        new_flow_path,
+        break_node,
     )
 
 
