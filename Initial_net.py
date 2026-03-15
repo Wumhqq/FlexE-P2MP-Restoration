@@ -167,8 +167,7 @@ def _find_leaf_sc_segment_with_base(P2MP_SC: np.ndarray, P2MP_FS: np.ndarray,
                                     span_len: int,
                                     src_node: int, src_p: int,
                                     phys_nodes: list, des: int,
-                                    usage: dict, sc_cap: float,
-                                    require_fs_empty: bool = False) -> tuple[int, int, dict] | None:
+                                    usage: dict, sc_cap: float) -> tuple[int, int, dict] | None:
     """在给定 base_fs 前提下寻找可用的 leaf SC 段。"""
     # base_fs 无效直接失败
     if int(base_fs) < 0:
@@ -229,21 +228,6 @@ def _find_leaf_sc_segment_with_base(P2MP_SC: np.ndarray, P2MP_FS: np.ndarray,
             if not fs_ok:
                 continue
             
-            if require_fs_empty:
-                # 要求 FS 必须全空，禁止在已占用 FS 上复用
-                fs_free = True
-                for fs_rel in range(int(fs_s_rel), int(fs_e_rel) + 1):
-                    try:
-                        used_list = P2MP_FS[dest][leaf_p][int(fs_rel)][1]
-                        path_list = P2MP_FS[dest][leaf_p][int(fs_rel)][2]
-                    except Exception:
-                        fs_free = False
-                        break
-                    if used_list or path_list:
-                        fs_free = False
-                        break
-                if not fs_free:
-                    continue
             # 该段 SC 的路径与目的节点必须一致
             if not _leaf_sc_segment_ok(P2MP_SC, dest, leaf_p, sc0, sc1, phys_nodes, des):
                 continue
@@ -377,7 +361,6 @@ def _alloc_new_leaf(node_P2MP: np.ndarray, node_flow: np.ndarray, P2MP_SC: np.nd
             src_node, src_p,
             phys_nodes, des,
             usage, sc_cap,
-            True,
         )
         if seg is None:
             continue
@@ -688,7 +671,7 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
                 dest, src, hub_p,
                 fs_s_glo, fs_e_glo,
                 phys_nodes, dest,
-                sc_cap, bw,
+                sc_cap_use, bw,
                 leaf_fixed_use, fixed_leaf_sc_range, fixed_leaf_usage,
             )
         else:
@@ -698,7 +681,7 @@ def _plan_sc_allocation(src: int, hub_p: int, hub_type: int, hub_fs0: int, dest:
                 dest, src, hub_p,
                 fs_s_glo, fs_e_glo, int(sc_end) - int(sc_start) + 1,
                 phys_nodes, dest,
-                usage, sc_cap,
+                usage, sc_cap_use,
                 leaf_fixed_use
             )
         if leaf_p is None or leaf_sc_s is None or leaf_sc_e is None or leaf_usage is None:
@@ -789,6 +772,8 @@ def allocate_flows_sequential(
                 node_flow[src][hub_p][0].append(f)
                 # leaf side
                 node_flow[des][leaf_p][0].append(f)
+                node_P2MP[src][hub_p][4] = float(node_P2MP[src][hub_p][4]) - float(bw)
+                node_P2MP[des][leaf_p][4] = float(node_P2MP[des][leaf_p][4]) - float(bw)
 
                 flow_acc[fid][7] = int(hub_p)
                 flow_acc[fid][8] = int(leaf_p)
@@ -882,6 +867,8 @@ def allocate_flows_sequential(
                 # commit
                 node_flow[src][hub_p][0].append(f)
                 node_flow[des][leaf_p][0].append(f)
+                node_P2MP[src][hub_p][4] = float(node_P2MP[src][hub_p][4]) - float(bw)
+                node_P2MP[des][leaf_p][4] = float(node_P2MP[des][leaf_p][4]) - float(bw)
 
                 flow_acc[fid][7] = int(hub_p)
                 flow_acc[fid][8] = int(leaf_p)
@@ -986,93 +973,132 @@ def restore_flows_sequential(
     break_node: int,
 ):
     """
-    基于已有资源表顺序恢复受影响流：
-    - 屏蔽故障节点；
-    - 为受影响的原始流直接按单跳流重建基础字段；
-    - 复用顺序分配器在当前状态上做重新分配。
-    """
-    # 屏蔽故障节点：故障节点对其它节点的距离设为无穷大
-    topo_dis_rest = np.array(topo_dis, copy=True)
-    topo_dis_rest[break_node, :] = np.inf
-    topo_dis_rest[:, break_node] = np.inf
-    topo_dis_rest[break_node, break_node] = 0
+    基于当前网络已有资源占用状态，对“受故障影响的业务流”进行顺序恢复。
 
-    # 逐条流构建可恢复列表（新流追加到已有表末尾）
+    这个函数的核心思路是：
+    1. 先把故障节点从拓扑里“屏蔽掉”，使后续路径计算无法再经过该节点；
+    2. 从 affected_flow 中提取需要恢复的原始流（同一原始流只处理一次）；
+    3. 为每条可恢复的原始流重新计算恢复路径、调制格式、SC 容量和所需 SC 数量；
+    4. 为这些恢复出来的“新子流”扩展 flow_acc / flow_path 表；
+    5. 调用 allocate_flows_sequential(...)，在当前已有资源状态上继续做逐流分配；
+    6. 返回恢复后的各类资源表，以及恢复失败的原始流编号列表。
+    """
+
+    # 1. 构造“故障后”的拓扑矩阵
+    topo_dis_rest = np.array(topo_dis, copy=True)
+    # topo_dis_rest[break_node, :] = np.inf
+    # topo_dis_rest[:, break_node] = np.inf
+
+    # 2. 遍历受影响流，构造“待恢复的新子流列表”
     flows_info = []
     new_items = []
     failed = []
     seen_orig = set()
     next_id = int(flow_acc.shape[0])
 
+    # 3. 对每条受影响流进行恢复前预处理
     for f in affected_flow:
+        # 原始流编号（不是恢复后新分配的子流编号）
         orig_id = int(f[0])
-        # 同一原流只处理一次，避免重复覆盖
+
+        # 同一原始流只处理一次，避免重复构造恢复请求
         if orig_id in seen_orig:
             continue
         seen_orig.add(orig_id)
+
+        # 提取流的源、宿、带宽
         src = int(f[1])
         dst = int(f[2])
         bw = float(f[3])
-        
-        # 故障节点作为端点的流不可恢复
+
+        # 如果故障节点本身就是源节点或目的节点，
+        # 那么这条流无法恢复，直接记为失败。
         if src == break_node or dst == break_node:
             failed.append(orig_id)
             continue
+
         try:
-            # 计算恢复路径（1-based 节点序列）
+            # 在“屏蔽故障节点后的拓扑”上重新计算最短路径
             path = k_shortest_path(topo_dis_rest, src + 1, dst + 1, 1)
             phys_nodes = path[0][0]
         except Exception:
+            # 如果最短路径计算异常，说明无法找到有效恢复路径
             failed.append(orig_id)
             continue
+
+        # 路径为空或者长度小于 2，说明源宿不可达，也判定恢复失败
         if not phys_nodes or len(phys_nodes) < 2:
             failed.append(orig_id)
             continue
-        # 依据恢复路径距离重算调制与 SC 需求
+
+        # 根据恢复路径重新计算路径总长度 dist
         dist = 0.0
         for a, b in zip(phys_nodes[:-1], phys_nodes[1:]):
             dist += float(topo_dis[int(a) - 1][int(b) - 1])
+
+        # 根据恢复路径长度和业务带宽重新计算：
+        # 1) 原始 SC 容量 sc_cap_raw
+        # 2) 调制相关信息（第二个返回值这里不使用）
         sc_cap_raw, _ = modu_format_Al(dist, bw)
         sc_cap = sc_effective_cap(float(sc_cap_raw))
         sc_num = sc_num_from_bw_cap(float(bw), float(sc_cap))
 
-        # 为恢复流分配新的子流编号（追加在末尾）
+        # 为恢复后的新子流分配一个新的 flow_id
         sub_id = next_id
         next_id += 1
 
-        # 构建基础字段（与 flow_acc 的 0..6 列一致）
+        # --------------------------------------------------------
+        # 构造新子流的基础信息，字段定义与 flow_acc 的前 7 列保持一致：
+        #
+        # [0] sub_id   : 新的子流编号
+        # [1] src      : 源节点
+        # [2] dst      : 目的节点
+        # [3] bw       : 带宽需求
+        # [4] sc_cap   : 单个 SC 的有效承载能力
+        # [5] sc_num   : 需要的 SC 数量
+        # [6] orig_id  : 对应的原始流编号
+        # --------------------------------------------------------
         item = [int(sub_id), src, dst, float(bw), float(sc_cap), int(sc_num), int(orig_id)]
         flows_info.append(item)
         new_items.append(item)
 
+    # 4. 如果没有任何可尝试恢复的流，直接返回
     if not flows_info:
         return node_flow, node_P2MP, flow_acc, link_FS, P2MP_SC, P2MP_FS, flow_path, failed
 
-    # 扩容 flow_acc 与 flow_path
+    # 5. 扩容 flow_acc 与 flow_path，为新恢复子流预留空间
+    # 需要追加的恢复子流数量
     add_n = len(new_items)
+
+    # 扩容 flow_acc
     flow_acc_ext = np.zeros((add_n, flow_acc.shape[1]), dtype=object)
     for i in range(add_n):
         flow_acc_ext[i][7:15] = [-1] * 8
     flow_acc = np.vstack([flow_acc, flow_acc_ext])
 
+    # 扩容 flow_path
     flow_path_ext = np.empty((add_n, flow_path.shape[1]), dtype=object)
     for i in range(add_n):
         for c in range(flow_path.shape[1]):
             flow_path_ext[i][c] = []
     flow_path = np.vstack([flow_path, flow_path_ext])
 
-    # 写入新流的基础字段并初始化路径记录
+    # 6. 把新子流的基础字段写入扩容后的 flow_acc / flow_path
     sub_to_orig = {}
     for item in new_items:
         sid = int(item[0])
         sub_to_orig[sid] = int(item[6])
-        flow_acc[sid][0:7] = item
-        flow_path[sid][0] = []
-        flow_path[sid][1] = []
-        flow_path[sid][2] = []
-        flow_path[sid][3] = []
 
-    # 复用顺序分配器在现有资源表上进行恢复分配
+        # 写入 flow_acc 前 0~6 列基础字段
+        flow_acc[sid][0:7] = item
+
+        # 初始化该新子流的路径记录
+        flow_path[sid][0] = []  # 通常用于记录 flow_id
+        flow_path[sid][1] = []  # 通常用于记录链路序列
+        flow_path[sid][2] = []  # 通常用于记录节点路径
+        flow_path[sid][3] = []  # 通常用于记录业务标签/附加信息
+
+    # 7. 在“已有资源表”基础上执行顺序式恢复分配
     node_flow, node_P2MP, flow_acc, link_FS, P2MP_SC, P2MP_FS, flow_path, failed_sub = allocate_flows_sequential(
         flows_info=np.array(flows_info, dtype=object),
         topo_num=topo_num,
@@ -1091,11 +1117,19 @@ def restore_flows_sequential(
         stop_on_fail=False,
     )
 
+    # 8. 将失败结果从“子流编号”映射回“原始流编号”
     failed_orig = list(failed)
+
     for sid in failed_sub:
         try:
+            # 优先通过 sub_to_orig 映射回原始流编号
             failed_orig.append(int(sub_to_orig.get(int(sid), int(sid))))
         except Exception:
+            # 极端情况下若映射异常，则跳过该项
             continue
+
+    # 去重并保持原有顺序
     failed_orig = list(dict.fromkeys(failed_orig))
+
+    # 9. 返回更新后的网络状态与恢复失败的原始流列表
     return node_flow, node_P2MP, flow_acc, link_FS, P2MP_SC, P2MP_FS, flow_path, failed_orig

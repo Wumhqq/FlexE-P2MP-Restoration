@@ -70,8 +70,9 @@ def _disassemble_flows(flows_info: list, topo_dis: np.ndarray) -> np.ndarray:
             disass_flows_info.append(temp)
     return np.array(disass_flows_info, dtype=object)
 
+
 def main():
-    flows_sum = 500
+    flows_sum = 5000
     topo_num, topo_matrix, topo_dis, link_num, link_index = topology(1)
     band = np.array([10, 40, 25])
     Tbox_num = 60#均分成3类
@@ -104,8 +105,12 @@ def main():
             # 寻找scr和des的最短路径，随机选择若干中转节点作为逻辑路径
             # 注意：k_shortest_path的scr和des是从1开始
             path = k_shortest_path(topo_dis, info[1] + 1, info[2] + 1, 1)
-            OEO_num = random.randint(0, len(path[0][0]) - 2)
-            OEO_node = random.sample(path[0][0][1:-1], OEO_num)
+            inner_nodes = path[0][0][1:-1]
+            if info[3] == 200 or info[3] == 175:
+                OEO_node = list(inner_nodes)
+            else:
+                OEO_num = random.randint(0, len(path[0][0]) - 2)
+                OEO_node = random.sample(inner_nodes, OEO_num)
             sorted_numbers = sorted(OEO_node, key=path[0][0].index)
             # 组装逻辑路径（1-based节点序列）
             if len(sorted_numbers) == 0:
@@ -248,6 +253,7 @@ def main():
     # 更新一下FlexE Group的剩余容量大小
     for u in range(topo_num):
         for p in range(Tbox_num * Tbox_P2MP):
+            new_node_P2MP[u][p][4] = 400
             # 用当前端口上承载的流重新扣减剩余容量
             for f in new_node_flow[u][p][0]:
                 new_node_P2MP[u][p][4] = new_node_P2MP[u][p][4] - f[3]
@@ -268,38 +274,95 @@ def main():
                     new_P2MP_SC_1[u][p][s][0] = []
                     new_P2MP_SC_1[u][p][s][2] = []
 
-    # 为未设置 base_fs 且当前无流的 P2MP 选择全路径可用的 FS 段，找不到则随机生成
-    for u in range(topo_num):
-        for p in range(Tbox_num * Tbox_P2MP):
-            base_fs = int(new_node_P2MP[u][p][5])
-            if base_fs >= 0:
-                continue
-            if len(new_node_flow[u][p][0]) != 0:
-                continue
-            p_type = int(new_node_P2MP[u][p][3])
-            block_size = int(type_P2MP[int(p_type) - 1][2])
-            base_fs = None
-            combined_usage = new_link_FS.sum(axis=0)
-            for i0 in range(len(combined_usage) - block_size + 1):
-                if np.all(combined_usage[i0:i0 + block_size] == 0):
-                    base_fs = int(i0)
-                    break
-            if base_fs is None:
-                max_start = max(0, new_link_FS.shape[1] - block_size)
-                base_fs = int(random.randint(0, max_start))
-            new_node_P2MP[u][p][5] = int(base_fs)
+    # 对比不同恢复算法时，必须让它们从同一份“故障后已释放旧资源”的基线状态出发，
+    # 不能串行复用同一套状态，否则前一个算法的恢复结果会污染后一个算法。
+    seq_node_flow = copy.deepcopy(new_node_flow)
+    seq_node_P2MP = copy.deepcopy(new_node_P2MP)
+    seq_link_FS = copy.deepcopy(new_link_FS)
+    seq_P2MP_SC = copy.deepcopy(new_P2MP_SC_1)
+    seq_P2MP_FS = copy.deepcopy(new_P2MP_FS)
+    seq_flow_acc = copy.deepcopy(new_flow_acc)
+    seq_flow_path = copy.deepcopy(new_flow_path)
 
-    node_flow_s1f, node_P2MP_s1f, flow_acc_s1f, link_FS_s1f, P2MP_SC_s1f, P2MP_FS_s1f, flow_path_s1f = Heuristic_algorithm(
+    dp_node_flow_in = copy.deepcopy(new_node_flow)
+    dp_node_P2MP_in = copy.deepcopy(new_node_P2MP)
+    dp_link_FS_in = copy.deepcopy(new_link_FS)
+    dp_P2MP_SC_in = copy.deepcopy(new_P2MP_SC_1)
+    dp_P2MP_FS_in = copy.deepcopy(new_P2MP_FS)
+    dp_flow_acc_in = copy.deepcopy(new_flow_acc)
+    dp_flow_path_in = copy.deepcopy(new_flow_path)
+
+    s1f_single_node_flow_in = copy.deepcopy(new_node_flow)
+    s1f_single_node_P2MP_in = copy.deepcopy(new_node_P2MP)
+    s1f_single_link_FS_in = copy.deepcopy(new_link_FS)
+    s1f_single_P2MP_SC_in = copy.deepcopy(new_P2MP_SC_1)
+    s1f_single_P2MP_FS_in = copy.deepcopy(new_P2MP_FS)
+    s1f_single_flow_acc_in = copy.deepcopy(new_flow_acc)
+    s1f_single_flow_path_in = copy.deepcopy(new_flow_path)
+
+    s1f_multi_node_flow_in = copy.deepcopy(new_node_flow)
+    s1f_multi_node_P2MP_in = copy.deepcopy(new_node_P2MP)
+    s1f_multi_link_FS_in = copy.deepcopy(new_link_FS)
+    s1f_multi_P2MP_SC_in = copy.deepcopy(new_P2MP_SC_1)
+    s1f_multi_P2MP_FS_in = copy.deepcopy(new_P2MP_FS)
+    s1f_multi_flow_acc_in = copy.deepcopy(new_flow_acc)
+    s1f_multi_flow_path_in = copy.deepcopy(new_flow_path)
+
+    r_node_flow, r_node_P2MP, r_flow_acc, r_link_FS, r_P2MP_SC, r_P2MP_FS, r_flow_path, r_failed_restore = restore_flows_sequential(
         affected_flow,
-        new_flow_acc,
-        new_node_flow,
-        new_node_P2MP,
+        topo_num,
+        topo_dis,
+        link_num,
+        link_index,
+        Tbox_num,
+        Tbox_P2MP,
+        seq_node_flow,
+        seq_node_P2MP,
+        seq_link_FS,
+        seq_P2MP_SC,
+        seq_P2MP_FS,
+        seq_flow_acc,
+        seq_flow_path,
+        break_node,
+    )
+    if r_failed_restore:
+        print(f"Baseline: Restoration_Sequential failed for orig_flow_ids={r_failed_restore}")
+    else:
+        print("Baseline: Restoration_Sequential completed successfully.")
+
+    dp_node_flow, dp_node_P2MP, dp_flow_acc, dp_link_FS, dp_P2MP_SC, dp_P2MP_FS, dp_flow_path, dp_failed_restore = restore_with_dp(
+        affected_flow,
+        topo_num,
+        topo_dis,
+        link_num,
+        link_index,
+        Tbox_num,
+        Tbox_P2MP,
+        dp_node_flow_in,
+        dp_node_P2MP_in,
+        dp_link_FS_in,
+        dp_P2MP_SC_in,
+        dp_P2MP_FS_in,
+        dp_flow_acc_in,
+        dp_flow_path_in,
+        break_node,
+    )
+    if dp_failed_restore:
+        print(f"DP: restore_with_dp failed for orig_flow_ids={dp_failed_restore}")
+    else:
+        print("DP: restore_with_dp completed successfully.")
+
+    s1f_single_node_flow, s1f_single_node_P2MP, s1f_single_flow_acc, s1f_single_link_FS, s1f_single_P2MP_SC, s1f_single_P2MP_FS, s1f_single_flow_path, s1f_single_failed_restore, s1f_single_tier1_restored, s1f_single_tier2_restored = Heuristic_algorithm(
+        affected_flow,
+        s1f_single_flow_acc_in,
+        s1f_single_node_flow_in,
+        s1f_single_node_P2MP_in,
         break_node,
         Tbox_num,
         Tbox_P2MP,
-        new_P2MP_SC_1,
-        new_link_FS,
-        new_P2MP_FS,
+        s1f_single_P2MP_SC_in,
+        s1f_single_link_FS_in,
+        s1f_single_P2MP_FS_in,
         node_flow,
         node_P2MP,
         flow_acc,
@@ -307,48 +370,46 @@ def main():
         P2MP_SC,
         P2MP_FS,
         flow_path,
+        s1f_single_flow_path_in,
+        restore_mode="singlehop",
     )
-
-
-    node_flow_r, node_P2MP_r, flow_acc_r, link_FS_r, P2MP_SC_r, P2MP_FS_r, flow_path_r, failed_restore = restore_flows_sequential(
-        affected_flow,
-        topo_num,
-        topo_dis,
-        link_num,
-        link_index,
-        Tbox_num,
-        Tbox_P2MP,
-        new_node_flow,
-        new_node_P2MP,
-        new_link_FS,
-        new_P2MP_SC_1,
-        new_P2MP_FS,
-        new_flow_acc,
-        new_flow_path,
-        break_node,
-    )
-    if failed_restore:
-        print(f"Restoration_Sequential failed for orig_flow_ids={failed_restore}")
+    if s1f_single_failed_restore:
+        print(f"S1F singlehop: Heuristic_algorithm failed for orig_flow_ids={s1f_single_failed_restore}")
     else:
-        print("Restoration_Sequential completed successfully.")
+        print("S1F singlehop: Heuristic_algorithm completed successfully.")
+    print(f"S1F singlehop: tier1_restored={s1f_single_tier1_restored}, tier2_restored={s1f_single_tier2_restored}")
 
-    node_flow_dp, node_P2MP_dp, flow_acc_dp, link_FS_dp, P2MP_SC_dp, flow_path_dp = restore_with_dp(
+    s1f_multi_node_flow, s1f_multi_node_P2MP, s1f_multi_flow_acc, s1f_multi_link_FS, s1f_multi_P2MP_SC, s1f_multi_P2MP_FS, s1f_multi_flow_path, s1f_multi_failed_restore, s1f_multi_tier1_restored, s1f_multi_tier2_restored = Heuristic_algorithm(
         affected_flow,
-        topo_num,
-        topo_dis,
-        link_num,
-        link_index,
+        s1f_multi_flow_acc_in,
+        s1f_multi_node_flow_in,
+        s1f_multi_node_P2MP_in,
+        break_node,
         Tbox_num,
         Tbox_P2MP,
-        new_node_flow,
-        new_node_P2MP,
-        new_link_FS,
-        new_P2MP_SC_1,
-        new_P2MP_FS,
-        new_flow_acc,
-        new_flow_path,
-        break_node,
+        s1f_multi_P2MP_SC_in,
+        s1f_multi_link_FS_in,
+        s1f_multi_P2MP_FS_in,
+        node_flow,
+        node_P2MP,
+        flow_acc,
+        link_FS,
+        P2MP_SC,
+        P2MP_FS,
+        flow_path,
+        s1f_multi_flow_path_in,
+        restore_mode="multihop",
     )
+    if s1f_multi_failed_restore:
+        print(f"S1F multihop: Heuristic_algorithm failed for orig_flow_ids={s1f_multi_failed_restore}")
+    else:
+        print("S1F multihop: Heuristic_algorithm completed successfully.")
+    print(f"S1F multihop: tier1_restored={s1f_multi_tier1_restored}, tier2_restored={s1f_multi_tier2_restored}")
+
+    a = 1
+
+
+    
 
 
 

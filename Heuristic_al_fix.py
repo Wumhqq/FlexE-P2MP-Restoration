@@ -25,14 +25,16 @@ from other_fx_fix import (
 )
 
 
-def logical_path_is_valid(path_1b: List[int], break_node_0b: int) -> bool:
-    """逻辑路径(1-based)必须简单且不能包含 break_node."""
+def logical_path_is_invalid(path_1b: List[int], break_node_0b: int) -> bool:
+    """逻辑路径不合理时返回 True：空路径、包含断点或存在重复节点。"""
     if not path_1b or len(path_1b) < 2:
-        return False
+        return True
     # break_node 0-based -> compare with 1-based path
     if (break_node_0b + 1) in path_1b:
-        return False
-    return len(set(path_1b)) == len(path_1b)
+        return True
+    unique_node_count = len(set(path_1b))
+    path_node_count = len(path_1b)
+    return unique_node_count != path_node_count
 
 
 def _infer_hw_modu_from_cap(cap: float) -> int:
@@ -225,7 +227,7 @@ def _attempt_restore_flow(
     snap = tuple(copy.deepcopy(x) for x in state)
 
     for lp_nodes_1b, _ in logical_paths:
-        if not logical_path_is_valid(lp_nodes_1b, break_node):
+        if logical_path_is_invalid(lp_nodes_1b, break_node):
             continue
         lp0 = [x - 1 for x in lp_nodes_1b]
 
@@ -360,7 +362,7 @@ def Heuristic_algorithm(
         try:
             paths = k_shortest_path(v_adj_s1, src + 1, dst + 1, 1)
             for p_nodes, _ in paths:
-                if logical_path_is_valid(p_nodes, break_node):
+                if not logical_path_is_invalid(p_nodes, break_node):
                     ok_s1 = True
                     break
         except Exception:

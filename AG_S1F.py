@@ -1,19 +1,54 @@
 from __future__ import annotations
 
+"""
+AG_S1F.py
+
+策略 1 优先（S1 first）的启发式恢复算法。
+
+这个版本在原始实现基础上做了两类改进：
+1. 修复了两个会在运行期触发 NameError 的确定性问题；
+2. 补充了模块级与关键路径级注释，方便后续维护和联调。
+
+核心思路：
+- 先从 DP 基线状态中提取受影响业务的历史资源占用；
+- 对每条业务分别构建“逻辑层候选路径 + 物理层候选路径”；
+- 在恢复时并列考虑两种算法：
+  1) 基于逻辑拓扑的多跳算法；
+  2) 直接 src->dst 的单跳算法；
+- 优先尝试保持原有端口/SC/硬件约束（strict_s1=True）；
+- 若严格复用失败，再进入允许重构的策略 2。
+
+主要输入/输出状态：
+- new_flow_acc   : 子流级资源映射表
+- new_node_flow  : 每个节点每个 P2MP 端口当前承载的子流列表
+- new_node_P2MP  : 每个节点每个 P2MP 端口的启用状态/类型/FS base 等
+- new_P2MP_SC    : 端口-时隙级占用详情
+- new_P2MP_FS    : 端口-FS 级占用详情
+- new_link_FS    : 链路绝对 FS 占用
+- new_flow_path  : 子流映射到物理链路/节点路径的记录
+
+注意：
+- 本文件默认节点内部索引使用 0-based；
+- 调用 k_shortest_path / 某些路径记录时会临时转换为 1-based；
+- SC 容量统一按 TS_UNIT 对齐，避免出现 2.5 TS 这类不可实际分配的粒度。
+"""
+
 import copy
+import math
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import topology as tp
 from k_shortest_path import k_shortest_path
 from modu_format_Al import modu_format_Al
+from SC_FS import sc_fs
 
 from Initial_net import (
+    TS_UNIT,
     _TYPE_INFO,
     _apply_leaf_usage,
     _apply_p2mp_fs_usage,
     _clear_p2mp_sc,
-    _find_free_fs_block,
     _plan_sc_allocation,
 )
 from other_fx_fix import (
@@ -23,7 +58,10 @@ from other_fx_fix import (
 )
 
 def sc_effective_cap(sc_cap: float) -> int:
-    """把 SC 容量映射成可用的整数 TS 容量（不允许 2.5 TS 这种分配）。
+    """把原始 SC 容量压缩到“按 TS 粒度可真正落地”的容量。
+
+    这里不能直接使用 modu_format_Al 返回的理论容量，
+    因为资源分配是按 TS_UNIT=5Gbps 的整数倍进行的。
     例如：12.5Gbps 只能承载 floor(12.5/5)=2 个 TS => 10Gbps。
     """
     return int(math.floor(float(sc_cap) / TS_UNIT) * TS_UNIT)
@@ -35,12 +73,85 @@ def sc_num_from_bw_cap(bw: float, sc_cap: float) -> int:
     return int(math.ceil(float(bw) / eff))
 
 def logical_path_is_valid(path_1b: List[int], break_node_0b: int) -> bool:
-    """验证逻辑路径：非空、不含中断节点、无重复节点。"""
+    """逻辑路径合理时返回 True：非空、不包含断点且不存在重复节点。"""
     if not path_1b or len(path_1b) < 2:
         return False
     if (break_node_0b + 1) in path_1b:
         return False
-    return len(set(path_1b)) == len(path_1b)
+    if len(set(path_1b)) != len(path_1b):
+        return False
+    return True
+
+
+def _find_free_fs_block_candidates(
+    link_FS: np.ndarray,
+    used_links: List[int],
+    block_size: int,
+) -> List[int]:
+    """返回所有可用的连续 FS block 起点，而不是只返回第一个。"""
+    if len(used_links) == 0:
+        combined_usage = np.zeros(link_FS.shape[1], dtype=link_FS.dtype)
+    else:
+        combined_usage = link_FS[used_links].sum(axis=0)
+
+    fs_candidates: List[int] = []
+    for fs0 in range(len(combined_usage) - int(block_size) + 1):
+        if np.all(combined_usage[fs0:fs0 + int(block_size)] == 0):
+            fs_candidates.append(int(fs0))
+    return fs_candidates
+
+
+def _fs_block_is_free(
+    link_FS: np.ndarray,
+    used_links: List[int],
+    fs0: int,
+    block_size: int,
+) -> bool:
+    """检查给定 hub base FS block 是否在 used_links 上全空闲。"""
+    fs1 = int(fs0) + int(block_size)
+    if fs0 < 0 or fs1 > link_FS.shape[1]:
+        return False
+    if len(used_links) == 0:
+        return True
+    return bool(np.all(link_FS[used_links, int(fs0):fs1] == 0))
+
+
+def _infer_hub_fs0_candidates_from_fixed_leaf(
+    dest: int,
+    hub_type: int,
+    fixed_leaf: int | None,
+    fixed_leaf_sc_range: Tuple[int, int] | None,
+    node_P2MP: np.ndarray,
+) -> List[int]:
+    """根据固定 leaf 的 SC 区间直接反推出可行的 hub base FS。"""
+    if fixed_leaf is None or fixed_leaf_sc_range is None:
+        return []
+
+    leaf_p = int(fixed_leaf)
+    if leaf_p < 0 or leaf_p >= node_P2MP.shape[1]:
+        return []
+    if int(node_P2MP[dest][leaf_p][2]) == 0:
+        return []
+
+    leaf_type = int(node_P2MP[dest][leaf_p][3])
+    leaf_base = int(node_P2MP[dest][leaf_p][5])
+    if leaf_base < 0:
+        return []
+
+    leaf_sc_s = int(fixed_leaf_sc_range[0])
+    leaf_sc_e = int(fixed_leaf_sc_range[1])
+    fs_s_glo = int(leaf_base) + int(sc_fs(int(leaf_type), int(leaf_sc_s), 1))
+
+    max_sc_idx = _TYPE_INFO[int(hub_type)][0] - 1
+    hub_fs_candidates: List[int] = []
+    for sc0_probe in range(max_sc_idx + 1):
+        hub_sc_s = int(sc0_probe)
+        hub_fs0 = int(fs_s_glo) - int(sc_fs(int(hub_type), int(hub_sc_s), 1))
+        if hub_fs0 < 0:
+            continue
+        if int(hub_fs0) not in hub_fs_candidates:
+            hub_fs_candidates.append(int(hub_fs0))
+    return hub_fs_candidates
 
 
 def _infer_hw_modu_from_cap(cap: float) -> int:
@@ -61,18 +172,6 @@ def _build_flow_metadata_map(
     return meta
 
 
-def _build_subflow_lookup(new_flow_acc: np.ndarray) -> Dict[Tuple[int, int, int], int]:
-    """建立 (原始流ID, hop_a, hop_b) 到子流ID的映射。"""
-    m: Dict[Tuple[int, int, int], int] = {}
-    for row in new_flow_acc:
-        sub_id = int(row[0])
-        a = int(row[1])
-        b = int(row[2])
-        orig = int(row[6])
-        m[(orig, a, b)] = sub_id
-    return m
-
-
 def _assign_one_hop_with_initialnet(
     flow: Any,
     a: int,
@@ -82,7 +181,6 @@ def _assign_one_hop_with_initialnet(
     link_index: np.ndarray,
     strict_s1: bool,
     meta: Dict[str, Any],
-    subflow_lookup: Dict[Tuple[int, int, int], int],
     new_flow_acc: np.ndarray,
     new_node_flow: np.ndarray,
     new_node_P2MP: np.ndarray,
@@ -93,21 +191,20 @@ def _assign_one_hop_with_initialnet(
 ) -> bool:
     """按 Initial_net 的约束为单个逻辑跳分配资源。"""
     # 流程概览：
-    # 1) 校验物理路径与子流映射，提取带宽/子流ID等关键参数
+    # 1) 校验物理路径，提取带宽/原始流ID等关键参数
     # 2) 基于物理路径计算链路占用与 SC 容量，并按策略1固定端口/时隙（若开启 strict_s1）
     # 3) 先尝试已启用的 hub 端口进行 SC 规划；成功则提交资源并返回
     # 4) 若已启用端口均失败，再尝试空闲端口：分配 FS block → SC 规划 → 成功提交，否则回滚端口状态
+    # 这个函数它负责回答一件事：“如果现在要把这一跳放到网络里，按当前策略和当前剩余资源，能不能放进去？”
+    # 同一条流的各个 hop，带宽需求通常还是这条流的带宽
+    # 但每个 hop 的物理路、端口、FS、SC、可复用性、是否受原配置约束，都是可能不同的
     if not phy_path0 or len(phy_path0) < 2:
         return False
 
-    # 基本流参数与子流映射
+    # 基本流参数
     fid = int(flow[0])
     band = float(flow[3])
-    sub_id = subflow_lookup.get((fid, a, b), None)
-    if sub_id is None:
-        return False
-    sub_id = int(sub_id)
-    orig_fid = int(new_flow_acc[sub_id][6]) if int(new_flow_acc[sub_id][6]) >= 0 else fid
+    orig_fid = fid
 
     # 物理链路索引（0-based）
     used_links: List[int] = []
@@ -123,12 +220,14 @@ def _assign_one_hop_with_initialnet(
     sc_cap = float(sc_effective_cap(sc_cap_raw))
 
     # 策略1：端点硬件/端口固定
+    # 这里是为了找sc_cap
+    # 如果当前 (a, b) 是中间 hop，则不会固定 hub/leaf，端口可按当前资源自由选择。
     fixed_hub = None
     fixed_leaf = None
     if strict_s1:
-        if int(flow[1]) == a and int(meta.get("hub_idx", -1)) != -1:
+        if a == int(flow[1]) and int(meta.get("hub_idx", -1)) != -1:
             fixed_hub = int(meta["hub_idx"])
-        if int(flow[2]) == b and int(meta.get("leaf_idx", -1)) != -1:
+        if b == int(flow[2]) and int(meta.get("leaf_idx", -1)) != -1:
             fixed_leaf = int(meta["leaf_idx"])
         if fixed_hub is not None and fixed_leaf is not None:
             hub_cap = float(meta.get("hub_cap", 0.0)) if meta is not None else 0.0
@@ -146,7 +245,8 @@ def _assign_one_hop_with_initialnet(
             old_cap = float(meta.get("leaf_cap", 0.0)) if meta is not None else 0.0
             if old_cap > 0:
                 sc_cap = float(sc_effective_cap(old_cap))
-
+                
+    # 这里是找hub_usage/leaf_usage
     fixed_hub_sc_range = None
     fixed_leaf_sc_range = None
     fixed_hub_usage = None
@@ -174,84 +274,118 @@ def _assign_one_hop_with_initialnet(
     for hub_p in hub_candidates:
         if hub_p is None:
             continue
-        if int(new_node_P2MP[a][hub_p][2]) != 1:
-            continue
-        used_bw = sum(float(x[3]) for x in new_node_flow[a][hub_p][0])
-        if used_bw + band > 400 + 1e-9:
-            continue
-        hub_type = int(new_node_P2MP[a][hub_p][3])
-        hub_fs0 = int(new_node_P2MP[a][hub_p][5])
-        if hub_fs0 < 0:
-            continue
-        flow_ids_on_hub = new_node_flow[a][hub_p][0]
-        plan = _plan_sc_allocation(
-            a, hub_p, hub_type, hub_fs0, b,
-            phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
-            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
-            fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
-        )
-        if plan is None:
-            continue
-        sc_s, sc_e, usage, fs_s_glo, fs_e_glo, leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage = plan
-        if fixed_leaf is not None and int(leaf_p) != int(fixed_leaf):
-            continue
-        _commit_plan(
-            sub_id, orig_fid, a, b, band, sc_cap, hub_p, hub_type, leaf_p,
-            sc_s, sc_e, fs_s_glo, fs_e_glo, leaf_sc_s, leaf_sc_e,
-            usage, leaf_usage, phys_nodes_1b, used_links,
-            new_flow_acc, new_node_flow, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path
-        )
-        return True
+        if int(new_node_P2MP[a][hub_p][2]) == 1:
+            used_bw = sum(float(x[3]) for x in new_node_flow[a][hub_p][0])
+            if used_bw + band > 400 + 1e-9:
+                continue
+            hub_type = int(new_node_P2MP[a][hub_p][3])
+            hub_fs0 = int(new_node_P2MP[a][hub_p][5])
+            if hub_fs0 < 0:
+                continue
+            flow_ids_on_hub = new_node_flow[a][hub_p][0]
+            plan = _plan_sc_allocation(
+                a, hub_p, hub_type, hub_fs0, b,
+                phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
+                new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
+                fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
+            )
+            if plan is None:
+                continue
+            sc_s, sc_e, usage, fs_s_glo, fs_e_glo, leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage = plan
+            if fixed_leaf is not None and int(leaf_p) != int(fixed_leaf):
+                continue
+            _commit_plan(
+                orig_fid, a, b, band, sc_cap, hub_p, hub_type, leaf_p,
+                sc_s, sc_e, fs_s_glo, fs_e_glo, leaf_sc_s, leaf_sc_e,
+                usage, leaf_usage, phys_nodes_1b, used_links,
+                new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path
+            )
+            return True
 
     # 再尝试空闲端口，先分配 FS block 再走同样的规划
     for hub_p in hub_candidates:
         if hub_p is None:
             continue
-        if int(new_node_P2MP[a][hub_p][2]) != 0:
-            continue
-        hub_type = int(new_node_P2MP[a][hub_p][3])
-        block_size = _TYPE_INFO[int(hub_type)][1]
-        hub_fs0 = _find_free_fs_block(new_link_FS, used_links, block_size)
-        if hub_fs0 is None:
-            continue
-        new_node_P2MP[a][hub_p][2] = 1
-        new_node_P2MP[a][hub_p][5] = int(hub_fs0)
-        new_node_flow[a][hub_p][0].clear()
-        _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
+        if int(new_node_P2MP[a][hub_p][2]) == 0:
+            hub_type = int(new_node_P2MP[a][hub_p][3])
+            block_size = _TYPE_INFO[int(hub_type)][1]
+            hub_fs_candidates = _infer_hub_fs0_candidates_from_fixed_leaf(
+                dest=b,
+                hub_type=hub_type,
+                fixed_leaf=fixed_leaf,
+                fixed_leaf_sc_range=fixed_leaf_sc_range,
+                node_P2MP=new_node_P2MP,
+            )
+            if not hub_fs_candidates:
+                hub_fs_candidates = _find_free_fs_block_candidates(new_link_FS, used_links, block_size)
+            if not hub_fs_candidates:
+                continue
 
-        flow_ids_on_hub = new_node_flow[a][hub_p][0]
-        plan = _plan_sc_allocation(
-            a, hub_p, hub_type, int(hub_fs0), b,
-            phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
-            new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
-            fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
-        )
-        if plan is None:
-            new_node_P2MP[a][hub_p][2] = 0
-            new_node_P2MP[a][hub_p][5] = -1
-            new_node_flow[a][hub_p][0].clear()
-            _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
-            continue
-        sc_s, sc_e, usage, fs_s_glo, fs_e_glo, leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage = plan
-        if fixed_leaf is not None and int(leaf_p) != int(fixed_leaf):
-            new_node_P2MP[a][hub_p][2] = 0
-            new_node_P2MP[a][hub_p][5] = -1
-            new_node_flow[a][hub_p][0].clear()
-            _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
-            continue
-        _commit_plan(
-            sub_id, orig_fid, a, b, band, sc_cap, hub_p, hub_type, leaf_p,
-            sc_s, sc_e, fs_s_glo, fs_e_glo, leaf_sc_s, leaf_sc_e,
-            usage, leaf_usage, phys_nodes_1b, used_links,
-            new_flow_acc, new_node_flow, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path
-        )
-        return True
+            for hub_fs0 in hub_fs_candidates:
+                new_node_P2MP[a][hub_p][2] = 1
+                new_node_P2MP[a][hub_p][5] = int(hub_fs0)
+                new_node_flow[a][hub_p][0].clear()
+                _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
+
+                flow_ids_on_hub = new_node_flow[a][hub_p][0]
+                plan = _plan_sc_allocation(
+                    a, hub_p, hub_type, int(hub_fs0), b,
+                    phys_nodes_1b, band, sc_cap, flow_ids_on_hub, new_flow_acc, new_P2MP_SC,
+                    new_node_P2MP, new_node_flow, new_link_FS, new_P2MP_FS, used_links, new_flow_path,
+                    fixed_hub_sc_range, fixed_hub_usage, fixed_leaf, fixed_leaf_sc_range, fixed_leaf_usage
+                )
+                if plan is None:
+                    new_node_P2MP[a][hub_p][2] = 0
+                    new_node_P2MP[a][hub_p][5] = -1
+                    new_node_flow[a][hub_p][0].clear()
+                    _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
+                    continue
+                sc_s, sc_e, usage, fs_s_glo, fs_e_glo, leaf_p, leaf_sc_s, leaf_sc_e, leaf_usage = plan
+                if fixed_leaf is not None and int(leaf_p) != int(fixed_leaf):
+                    new_node_P2MP[a][hub_p][2] = 0
+                    new_node_P2MP[a][hub_p][5] = -1
+                    new_node_flow[a][hub_p][0].clear()
+                    _clear_p2mp_sc(new_P2MP_SC, a, hub_p)
+                    continue
+                _commit_plan(
+                    orig_fid, a, b, band, sc_cap, hub_p, hub_type, leaf_p,
+                    sc_s, sc_e, fs_s_glo, fs_e_glo, leaf_sc_s, leaf_sc_e,
+                    usage, leaf_usage, phys_nodes_1b, used_links,
+                    new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path
+                )
+                return True
 
     return False
 
 
+def _append_restored_subflow(
+    new_flow_acc: np.ndarray,
+    new_flow_path: np.ndarray,
+    orig_fid: int,
+    a: int,
+    b: int,
+    band: float,
+    sc_cap: float,
+    sc_num: int,
+) -> int:
+    """为恢复得到的新 hop 追加一条子流记录，并返回新的 subflow_id。"""
+    sub_id = int(new_flow_acc.shape[0])
+
+    new_flow_acc.resize((sub_id + 1, new_flow_acc.shape[1]), refcheck=False)
+    new_flow_acc[sub_id] = [
+        int(sub_id), int(a), int(b), float(band), float(sc_cap), int(sc_num), int(orig_fid),
+        -1, -1, -1, -1, -1, -1, -1, -1,
+    ]
+
+    new_flow_path.resize((sub_id + 1, new_flow_path.shape[1]), refcheck=False)
+    new_flow_path[sub_id][0] = []
+    new_flow_path[sub_id][1] = []
+    new_flow_path[sub_id][2] = []
+    new_flow_path[sub_id][3] = []
+    return sub_id
+
+
 def _commit_plan(
-    sub_id: int,
     orig_fid: int,
     a: int,
     b: int,
@@ -272,17 +406,33 @@ def _commit_plan(
     used_links: List[int],
     new_flow_acc: np.ndarray,
     new_node_flow: np.ndarray,
+    new_node_P2MP: np.ndarray,
     new_P2MP_SC: np.ndarray,
     new_link_FS: np.ndarray,
     new_P2MP_FS: np.ndarray,
     new_flow_path: np.ndarray,
 ) -> None:
-    """将计划的 SC/FS 分配写入全部状态结构。"""
+    """将规划结果一次性写回所有资源状态表。"""
     sc_num = int(sc_e) - int(sc_s) + 1
+    sub_id = _append_restored_subflow(new_flow_acc, new_flow_path, orig_fid, a, b, band, sc_cap, sc_num)
+
     subflow_info = [int(sub_id), int(a), int(b), float(band), float(sc_cap), int(sc_num), int(orig_fid)]
     new_node_flow[a][hub_p][0].append(subflow_info)
     new_node_flow[b][leaf_p][0].append(subflow_info)
+    new_node_P2MP[a][hub_p][4] = float(new_node_P2MP[a][hub_p][4]) - float(band)
+    new_node_P2MP[b][leaf_p][4] = float(new_node_P2MP[b][leaf_p][4]) - float(band)
+    if int(new_node_P2MP[a][hub_p][2]) == 0:
+        new_node_P2MP[a][hub_p][2] = 1
+    if int(new_node_P2MP[b][leaf_p][2]) == 0:
+        new_node_P2MP[b][leaf_p][2] = 1
 
+    new_flow_acc[sub_id][0] = int(sub_id)
+    new_flow_acc[sub_id][1] = int(a)
+    new_flow_acc[sub_id][2] = int(b)
+    new_flow_acc[sub_id][3] = float(band)
+    new_flow_acc[sub_id][4] = float(sc_cap)
+    new_flow_acc[sub_id][5] = int(sc_num)
+    new_flow_acc[sub_id][6] = int(orig_fid)
     new_flow_acc[sub_id][7] = int(hub_p)
     new_flow_acc[sub_id][8] = int(leaf_p)
     new_flow_acc[sub_id][9] = int(sc_s)
@@ -331,7 +481,7 @@ def _commit_plan(
         new_link_FS[int(l)][int(fs_s_glo):int(fs_e_glo) + 1] += 1
 
 
-def _attempt_restore_flow(
+def _attempt_restore_flow_multihop(
     flow: Any,
     break_node: int,
     v_adj: np.ndarray,
@@ -340,10 +490,9 @@ def _attempt_restore_flow(
     flow_metadata_map: Dict[int, Dict[str, Any]],
     link_index: np.ndarray,
     strict_s1: bool,
-    subflow_lookup: Dict[Tuple[int, int, int], int],
     state: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
 ) -> Tuple[bool, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """枚举逻辑路径并逐跳提交资源以尝试恢复该流。"""
+    """多跳算法：枚举逻辑路径并逐跳提交资源以尝试恢复该流。"""
     # 流程概览：
     # 1) 提取源宿节点，计算 K 条逻辑候选路径（1-based）
     # 2) 为每条逻辑路径创建独立快照，逐跳尝试分配资源
@@ -358,6 +507,10 @@ def _attempt_restore_flow(
         # 路径搜索异常时视为无可用逻辑路径
         logical_paths = []
 
+    print(f"[AG_S1F][multihop] flow={int(flow[0])} logical_paths={len(logical_paths)}")
+    for idx, (p_nodes, p_weight) in enumerate(logical_paths, start=1):
+        print(f"  path{idx}: nodes={list(p_nodes)}, weight={float(p_weight)}")
+
     # 保存原始状态快照，保证路径失败不污染外部状态
     snap = tuple(copy.deepcopy(x) for x in state)
     # 获取该流的元数据，用于跳级资源分配
@@ -366,7 +519,8 @@ def _attempt_restore_flow(
     # 枚举每条逻辑路径，逐跳尝试分配资源
     for lp_nodes_1b, _ in logical_paths:
         # 逻辑路径有效性检查（例如绕开断点）
-        if not logical_path_is_valid(lp_nodes_1b, break_node):
+        is_valid = logical_path_is_valid(lp_nodes_1b, break_node)
+        if not is_valid:
             continue
         # 逻辑路径节点改为 0-based 以匹配内部索引
         lp0 = [x - 1 for x in lp_nodes_1b]
@@ -397,7 +551,6 @@ def _attempt_restore_flow(
                 link_index=link_index,
                 strict_s1=strict_s1,
                 meta=meta,
-                subflow_lookup=subflow_lookup,
                 new_flow_acc=work_flow_acc,
                 new_node_flow=work_node_flow,
                 new_node_P2MP=work_node_P2MP,
@@ -408,6 +561,10 @@ def _attempt_restore_flow(
             )
             # 单跳失败则该逻辑路径失败
             if not ok_hop:
+                print(
+                    f"[AG_S1F][multihop] flow={int(flow[0])} hop_failed="
+                    f"({int(a)}->{int(b)}) logical_path={lp0} phy_path={phy_path0}"
+                )
                 ok_path = False
                 break
 
@@ -417,6 +574,115 @@ def _attempt_restore_flow(
 
     # 所有候选路径失败，返回原始状态
     return False, state
+
+
+def _attempt_restore_flow_singlehop(
+    flow: Any,
+    phy_pool: Dict[Tuple[int, int], List[Dict[str, Any]]],
+    flow_metadata_map: Dict[int, Dict[str, Any]],
+    link_index: np.ndarray,
+    strict_s1: bool,
+    state: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> Tuple[bool, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """单跳算法：直接对 src->dst 的物理候选路径逐条尝试资源分配。"""
+    src = int(flow[1])
+    dst = int(flow[2])
+    meta = flow_metadata_map.get(int(flow[0]), {})
+    snap = tuple(copy.deepcopy(x) for x in state)
+
+    direct_candidates = phy_pool.get((src, dst), [])
+    for phy_cand in direct_candidates:
+        work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC, work_link_FS, work_P2MP_FS, work_flow_path = copy.deepcopy(snap)
+
+        ok_hop = _assign_one_hop_with_initialnet(
+            flow=flow,
+            a=src,
+            b=dst,
+            phy_path0=list(phy_cand["path"]),
+            phy_dist=float(phy_cand["dist"]),
+            link_index=link_index,
+            strict_s1=strict_s1,
+            meta=meta,
+            new_flow_acc=work_flow_acc,
+            new_node_flow=work_node_flow,
+            new_node_P2MP=work_node_P2MP,
+            new_P2MP_SC=work_P2MP_SC,
+            new_link_FS=work_link_FS,
+            new_P2MP_FS=work_P2MP_FS,
+            new_flow_path=work_flow_path,
+        )
+        if ok_hop:
+            return True, (work_flow_acc, work_node_flow, work_node_P2MP, work_P2MP_SC, work_link_FS, work_P2MP_FS, work_flow_path)
+
+    return False, state
+
+
+def _mode_has_s1_candidate(
+    restore_mode: str,
+    flow: Any,
+    break_node: int,
+    v_adj_s1: np.ndarray,
+    v_phy_s1: Dict[Tuple[int, int], Dict[str, Any]],
+) -> bool:
+    """按所选算法判断该流是否具备 S1 尝试资格。"""
+    src = int(flow[1])
+    dst = int(flow[2])
+
+    if restore_mode == "singlehop":
+        return (src, dst) in v_phy_s1
+
+    if restore_mode == "multihop":
+        try:
+            paths = k_shortest_path(v_adj_s1, src + 1, dst + 1, 1)
+            for p_nodes, _ in paths:
+                is_valid = logical_path_is_valid(p_nodes, break_node)
+                if is_valid:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    raise ValueError(f"Unknown restore_mode={restore_mode}")
+
+
+def _attempt_restore_flow_by_mode(
+    restore_mode: str,
+    flow: Any,
+    break_node: int,
+    v_adj: np.ndarray,
+    v_phy: Dict[Tuple[int, int], Dict[str, Any]],
+    phy_pool: Dict[Tuple[int, int], List[Dict[str, Any]]],
+    K_LOGICAL_PATHS: int,
+    flow_metadata_map: Dict[int, Dict[str, Any]],
+    link_index: np.ndarray,
+    strict_s1: bool,
+    state: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> Tuple[bool, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """按指定模式选择单跳算法或多跳算法。"""
+    if restore_mode == "singlehop":
+        return _attempt_restore_flow_singlehop(
+            flow=flow,
+            phy_pool=phy_pool,
+            flow_metadata_map=flow_metadata_map,
+            link_index=link_index,
+            strict_s1=strict_s1,
+            state=state,
+        )
+
+    if restore_mode == "multihop":
+        return _attempt_restore_flow_multihop(
+            flow=flow,
+            break_node=break_node,
+            v_adj=v_adj,
+            v_phy=v_phy,
+            K_LOGICAL_PATHS=K_LOGICAL_PATHS,
+            flow_metadata_map=flow_metadata_map,
+            link_index=link_index,
+            strict_s1=strict_s1,
+            state=state,
+        )
+
+    raise ValueError(f"Unknown restore_mode={restore_mode}")
 
 
 def Heuristic_algorithm(
@@ -437,8 +703,19 @@ def Heuristic_algorithm(
     P2MP_SC_base: np.ndarray,
     P2MP_FS_base: np.ndarray,
     flow_path_base: np.ndarray,
+    new_flow_path: np.ndarray,
+    restore_mode: str = "multihop",
 ):
-    """策略1优先的恢复流程，并复用 Initial_net 资源分配约束。"""
+    """策略1优先的恢复流程，并复用 Initial_net 资源分配约束。
+
+    返回值依次为：
+    new_node_flow, new_node_P2MP, new_flow_acc,
+    new_link_FS, new_P2MP_SC, new_P2MP_FS, new_flow_path,
+    failed_orig, tier1_restored_ids, tier2_restored_ids
+    """
+    if restore_mode not in ("singlehop", "multihop"):
+        raise ValueError(f"Unknown restore_mode={restore_mode}")
+
     # 读取拓扑与链路索引，所有路径搜索与资源分配都基于该拓扑
     topo_num, _, topo_dis, link_num, link_index = tp.topology(1)
 
@@ -465,12 +742,8 @@ def Heuristic_algorithm(
             except Exception:
                 continue
 
-    # 从 DP 状态提取原有流的历史资源信息，并建立子流索引
+    # 从 DP 状态提取原有流的历史资源信息
     flow_metadata_map = _build_flow_metadata_map(affected_flow, flow_acc_base, P2MP_SC_base)
-    subflow_lookup = _build_subflow_lookup(new_flow_acc)
-
-    # 从 DP 复制 flow_path，避免直接修改输入引用
-    new_flow_path = copy.deepcopy(flow_path_base)
 
     # 分层队列：Tier1 代表可走策略1（硬件/路径兼容），Tier2 代表需要更自由的策略2
     tier1_flows: List[Any] = []
@@ -493,16 +766,8 @@ def Heuristic_algorithm(
         )
         flow_vmap_s1[fid] = (v_adj_s1, v_phy_s1)
 
-        # 快速判断策略1下是否连通
-        ok_s1 = False
-        try:
-            paths = k_shortest_path(v_adj_s1, src + 1, dst + 1, 1)
-            for p_nodes, _ in paths:
-                if logical_path_is_valid(p_nodes, break_node):
-                    ok_s1 = True
-                    break
-        except Exception:
-            ok_s1 = False
+        # 按当前算法模式判断该流是否值得进入 S1 队列。
+        ok_s1 = _mode_has_s1_candidate(restore_mode, f, break_node, v_adj_s1, v_phy_s1)
 
         if ok_s1:
             tier1_flows.append(f)
@@ -519,37 +784,38 @@ def Heuristic_algorithm(
     # 先对 Tier1 的端口/SC 进行占位，避免资源被后续流抢占
     manage_s1_reservation_by_copy(
         tier1_flows, flow_metadata_map,
-        flow_acc_base, node_P2MP_base, P2MP_SC_base,
-        new_node_P2MP, new_P2MP_SC,
+        flow_acc_base, node_P2MP_base, P2MP_SC_base, P2MP_FS_base, flow_path_base,
+        new_node_flow, new_node_P2MP, new_P2MP_SC, new_P2MP_FS, new_link_FS,
         action="reserve"
     )
 
     tier1_restored, tier1_failed = [], []
 
-    # 先尝试策略1恢复：逐流回滚本流占位，再进行路径搜索与逐跳分配
+    # 先尝试策略1恢复：逐流回滚本流占位，再按指定模式执行恢复。
     for f in tier1_flows:
         fid = int(f[0])
 
-        # 对当前流撤销占位，避免影响真实分配
+        # 对当前流撤销占位，避免影响真实分配paths = k_shortest_path(v_adj_s1, src + 1, dst + 1, 1)
         manage_s1_reservation_by_copy(
             [f], flow_metadata_map,
-            flow_acc_base, node_P2MP_base, P2MP_SC_base,
-            new_node_P2MP, new_P2MP_SC,
+            flow_acc_base, node_P2MP_base, P2MP_SC_base, P2MP_FS_base, flow_path_base,
+            new_node_flow, new_node_P2MP, new_P2MP_SC, new_P2MP_FS, new_link_FS,
             action="rollback"
         )
 
         v_adj, v_phy = flow_vmap_s1[fid]
-        # 尝试在策略1约束下恢复：多条逻辑路径逐条尝试，成功即提交
-        restored, new_state = _attempt_restore_flow(
+        # 尝试在策略1约束下恢复。
+        restored, new_state = _attempt_restore_flow_by_mode(
+            restore_mode=restore_mode,
             flow=f,
             break_node=break_node,
             v_adj=v_adj,
             v_phy=v_phy,
+            phy_pool=phy_pool,
             K_LOGICAL_PATHS=K_LOGICAL_PATHS,
             flow_metadata_map=flow_metadata_map,
             link_index=link_index,
             strict_s1=True,
-            subflow_lookup=subflow_lookup,
             state=(new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path),
         )
         if restored:
@@ -565,21 +831,22 @@ def Heuristic_algorithm(
 
     tier2_restored, tier2_failed = [], []
 
-    # 再尝试策略2恢复：允许重构，逻辑路径搜索与逐跳分配同样走统一流程
+    # 再尝试策略2恢复：允许重构，并按指定模式执行恢复。
     for f in tier2_flows:
         fid = int(f[0])
 
         v_adj, v_phy = flow_vmap_s2[fid]
-        restored, new_state = _attempt_restore_flow(
+        restored, new_state = _attempt_restore_flow_by_mode(
+            restore_mode=restore_mode,
             flow=f,
             break_node=break_node,
             v_adj=v_adj,
             v_phy=v_phy,
+            phy_pool=phy_pool,
             K_LOGICAL_PATHS=K_LOGICAL_PATHS,
             flow_metadata_map=flow_metadata_map,
             link_index=link_index,
             strict_s1=False,
-            subflow_lookup=subflow_lookup,
             state=(new_flow_acc, new_node_flow, new_node_P2MP, new_P2MP_SC, new_link_FS, new_P2MP_FS, new_flow_path),
         )
         if restored:
@@ -590,5 +857,21 @@ def Heuristic_algorithm(
         else:
             tier2_failed.append(f)
 
-    # 返回恢复后的资源状态
-    return new_node_flow, new_node_P2MP, new_flow_acc, new_link_FS, new_P2MP_SC, new_P2MP_FS, new_flow_path
+    failed_orig = [int(f[0]) for f in tier2_failed]
+    failed_orig = list(dict.fromkeys(failed_orig))
+    tier1_restored_ids = [int(f[0]) for f in tier1_restored]
+    tier1_restored_ids = list(dict.fromkeys(tier1_restored_ids))
+    tier2_restored_ids = [int(f[0]) for f in tier2_restored]
+    tier2_restored_ids = list(dict.fromkeys(tier2_restored_ids))
+    return (
+        new_node_flow,
+        new_node_P2MP,
+        new_flow_acc,
+        new_link_FS,
+        new_P2MP_SC,
+        new_P2MP_FS,
+        new_flow_path,
+        failed_orig,
+        tier1_restored_ids,
+        tier2_restored_ids,
+    )
